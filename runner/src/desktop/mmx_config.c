@@ -611,6 +611,13 @@ static bool HandleIniConfig(int section, const char *key, char *value) {
       return ParseBool(value, &g_config.enable_snes9x_oracle);
     } else if (StringEqualsNoCase(key, "SkipLauncher")) {
       return ParseBool(value, &g_config.skip_launcher);
+    } else if (StringEqualsNoCase(key, "Language")) {
+      g_config.language = (int)strtol(value, (char **)NULL, 10);
+      if (g_config.language < 0) g_config.language = 0;
+      return true;
+    } else if (StringEqualsNoCase(key, "LanguageFile")) {
+      snprintf(g_config.language_file, sizeof(g_config.language_file), "%s", value);
+      return true;
     }
   } else if (section == 6) {
     if (StringEqualsNoCase(key, "PlayerName")) {
@@ -904,6 +911,8 @@ void WriteConfigFile(const char *filename) {
     { "GamepadMap", "EnableGamepad1" },
     { "GamepadMap", "EnableGamepad2" },
     { "General",    "SkipLauncher" },
+    { "General",    "Language" },
+    { "General",    "LanguageFile" },
     { "GamepadMap", "GamepadDeadzone" },
     { "Netplay",    "PlayerName" },
     { "Graphics",   "FrameBlend" },
@@ -946,6 +955,8 @@ void WriteConfigFile(const char *filename) {
   CfgSet(kvs, N, "GamepadMap", "EnableGamepad2", "%s",
          g_config.enable_gamepad[1] ? "true" : "false");
   CfgSet(kvs, N, "General", "SkipLauncher", "%d", g_config.skip_launcher ? 1 : 0);
+  CfgSet(kvs, N, "General", "Language", "%d", g_config.language);
+  CfgSet(kvs, N, "General", "LanguageFile", "%s", g_config.language_file);
   CfgSet(kvs, N, "GamepadMap", "GamepadDeadzone", "%d", g_config.gamepad_deadzone);
   CfgSet(kvs, N, "Netplay", "PlayerName", "%s", g_config.netplay_player_name);
   CfgSet(kvs, N, "Graphics", "FrameBlend", "%d", g_config.frame_blend ? 1 : 0);

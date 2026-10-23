@@ -301,6 +301,8 @@ static bool g_reset_clock;
 static double g_simulation_hz = SNES_HOST_NTSC_HZ;
 
 int snesrecomp_desktop_frame_width(void) { return g_snes_width > 0 ? g_snes_width : 256; }
+int snesrecomp_desktop_language(void) { return g_config.language; }
+const char *snesrecomp_desktop_language_file(void) { return g_config.language_file; }
 int snesrecomp_desktop_frame_height(void) { return g_snes_height > 0 ? g_snes_height : 224; }
 void snesrecomp_desktop_request_clock_reset(void) { g_reset_clock = true; }
 
@@ -3032,6 +3034,15 @@ static void LauncherSeedRomCatalog(RecompLauncherCGameInfo *gi) {
 
 #if defined(RECOMP_LAUNCHER)
 
+/* recomp-ui's language check carries a context; the title's does not. */
+static int LauncherLanguageAvailable(void *ctx, int index, const char *file,
+                                     char *reason, size_t reason_size) {
+  (void)ctx;
+  return g_game->language_available
+             ? g_game->language_available(index, file, reason, reason_size)
+             : 1;
+}
+
 /* What the launcher opens on: the live settings, and what this host offers.
  * In session, netplay and Generate & rebuild are withheld -- the first would
  * replace a session that is still alive, the second the binary running it. */
@@ -3072,6 +3083,8 @@ static void LauncherSeed(RecompLauncherCSettings *ls, RecompLauncherCGameInfo *g
     ls->deadzone[seat] = (g_config.gamepad_deadzone * 100 + 32767 / 2) / 32767;
   ls->skip_launcher = g_config.skip_launcher;
   ls->msu1_enabled  = 0;
+  ls->language_index = g_config.language;
+  snprintf(ls->language_file, sizeof(ls->language_file), "%s", g_config.language_file);
   /* Display rows the framework host wires (see FrameBlendConfigure,
    * RendererApply, the vsync flags at presenter creation, and
    * snes_runahead_run_frame in the frame loop). */
@@ -3119,6 +3132,15 @@ static void LauncherSeed(RecompLauncherCSettings *ls, RecompLauncherCGameInfo *g
 #endif
   gi->widescreen_supported = game->widescreen_supported;
   gi->msu1_supported = game->msu1_supported;
+  /* Settings -> Localization: the title's languages and the file one needs. */
+  if (game->num_languages > 0 && game->language_labels) {
+    gi->language_labels = game->language_labels;
+    gi->num_languages = game->num_languages;
+    gi->language_ui_codes = game->language_ui_codes;
+    gi->language_file_label = game->language_file_label;
+    gi->language_file_pattern = game->language_file_pattern;
+    gi->language_available = game->language_available ? LauncherLanguageAvailable : NULL;
+  }
   /* Capability rows: each is drawn only because this host wires it. A
    * row that does nothing is worse than no row. */
 #if defined(SNESRECOMP_HOST_HAS_BLEND)
@@ -3208,6 +3230,10 @@ static void LauncherCommit(const RecompLauncherCSettings *ls, const char *config
   }
   g_config.gamepad_deadzone    = (ls->deadzone[0] * 32767 + 50) / 100;
   g_config.skip_launcher       = ls->skip_launcher != 0;
+  if (game->num_languages > 0) {
+    g_config.language = ls->language_index;
+    snprintf(g_config.language_file, sizeof(g_config.language_file), "%s", ls->language_file);
+  }
   g_config.frame_blend         = ls->frame_blend != 0;
   g_config.run_ahead           = ls->run_ahead;
   if (game->rewind_settings) {
@@ -3385,7 +3411,7 @@ static int RuntimeMenuSet(void *context, const RecompRuntimeUiItem *item, int va
   } else if (RuntimeMenuIs(item, RECOMP_RUNTIME_UI_KEY_VOLUME)) {
     g_config.volume = value;
     ApplyVolume();
-    g_volume_changed = true;
+    g_config_dirty = true;
   } else if (RuntimeMenuIs(item, RECOMP_RUNTIME_UI_KEY_MENU_DIM) ||
              RuntimeMenuIs(item, RECOMP_RUNTIME_UI_KEY_MENU_OPACITY)) {
     if (RuntimeMenuIs(item, RECOMP_RUNTIME_UI_KEY_MENU_DIM)) g_runtime_ui_dim = value;
@@ -3927,6 +3953,16 @@ int snesrecomp_desktop_main(const SnesDesktopHostGame *game, int argc, char **ar
     PadGestureConfigure(&g_launcher_gesture, g_config.launcher_gesture,
                         "Select+L3", "launcher", "LauncherGesture");
 #if defined(RECOMP_LAUNCHER)
+  /* The interface speaks the saved language from its first frame. A saved
+   * language whose file is no longer usable falls back to the first one. */
+  if (game->num_languages > 0) {
+    if (g_config.language >= game->num_languages) g_config.language = 0;
+    if (g_config.language > 0 && game->language_available &&
+        !game->language_available(g_config.language, g_config.language_file, NULL, 0))
+      g_config.language = 0;
+    if (game->language_ui_codes && game->language_ui_codes[g_config.language])
+      recomp_launcher_set_ui_language(game->language_ui_codes[g_config.language]);
+  }
   if (game->in_game_menu) {
     PadGestureConfigure(&g_menu_gesture, g_config.menu_gesture,
                         "Select+Start", "menu", "MenuGesture");

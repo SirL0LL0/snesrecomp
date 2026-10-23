@@ -211,11 +211,6 @@ static int ppu_resolve_pixel(Ppu *ppu, int x, int y, bool sub,
   actMode = PPU_mode(ppu) == 7 && PPU_m7extBg(ppu) ? 9 : actMode;
   int layer = 5;
   int pixel = 0;
-  if (y == 200 && (x == 10 || x == 200)) {
-    fprintf(stderr, "RES x=%d y=%d mode=%d act=%d tm=%02X ts=%02X count=%d\n",
-            x, y, PPU_mode(ppu), actMode, ppu->screenEnabled[0],
-            ppu->screenEnabled[1], layer_count_per_mode[actMode]);
-  }
   for (int i = 0; i < layer_count_per_mode[actMode]; i++) {
     int curLayer = layers_per_mode[actMode][i];
     int curPriority = priorities_per_mode[actMode][i];

@@ -120,6 +120,11 @@ typedef struct Config {
   // Set from the launcher's dashboard checkbox. Force the launcher back with the
   // --launcher argument or by setting SkipLauncher = 0 in config.ini.
   bool skip_launcher;
+  /* [General] Language: index into the title's language list (0 = the
+   * first, the release's own); LanguageFile: the file a language needs, e.g.
+   * a translation patch the player supplies. */
+  int language;
+  char language_file[512];
   bool expose_coverage_mod;
   int coverage_capture; /* -1 absent: use Mods selection */
 

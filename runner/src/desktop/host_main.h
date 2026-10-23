@@ -241,6 +241,22 @@ typedef struct SnesDesktopHostGame {
    * Requires a launcher build (RECOMP_LAUNCHER). Zero keeps today's
    * behaviour exactly. */
   int in_game_menu;
+
+  /* Languages (the launcher's Settings -> Localization). language_labels
+   * lists them, entry 0 being the release's own; language_ui_codes gives the
+   * launcher/in-game-menu language each one switches to ("en", "it"). A
+   * language may need a file the player supplies (a translation patch):
+   * language_file_label names the row that picks it, language_file_pattern
+   * filters the picker, and language_available says whether entry `index`
+   * can be chosen with `file` (fill `reason` when not; NULL = always). The
+   * choice is [General] Language / LanguageFile; the title reads it with
+   * snesrecomp_desktop_language() / snesrecomp_desktop_language_file(). */
+  const char *const *language_labels;
+  const char *const *language_ui_codes;
+  int num_languages;
+  const char *language_file_label;
+  const char *language_file_pattern;
+  int (*language_available)(int index, const char *file, char *reason, size_t reason_cap);
 } SnesDesktopHostGame;
 
 /* The whole program. Returns the process exit code. */
@@ -249,6 +265,10 @@ int snesrecomp_desktop_main(const SnesDesktopHostGame *game, int argc, char **ar
 /* The last simulated frame's width, as decided by prepare_frame (256 by
  * default). For per-title code that composes against the current frame. */
 int snesrecomp_desktop_frame_width(void);
+/* The language chosen in the launcher (index into language_labels) and the
+ * file it needs ("" when none), as saved in config.ini. */
+int snesrecomp_desktop_language(void);
+const char *snesrecomp_desktop_language_file(void);
 int snesrecomp_desktop_frame_height(void);
 void snesrecomp_desktop_set_widescreen(int enabled);
 /* Selected PPU renderer, shared by hotkeys and diagnostic playback. Setting
