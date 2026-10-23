@@ -482,6 +482,9 @@ static bool HandleIniConfig(int section, const char *key, char *value) {
     } else if (StringEqualsNoCase(key, "LauncherGesture")) {
       snprintf(g_config.launcher_gesture, sizeof(g_config.launcher_gesture), "%s", value);
       return true;
+    } else if (StringEqualsNoCase(key, "MenuGesture")) {
+      snprintf(g_config.menu_gesture, sizeof(g_config.menu_gesture), "%s", value);
+      return true;
     } else if (StringStartsWithNoCase(key, "SourceP") && key[7] >= '1' &&
                key[7] < '1' + kSnesHostPadSeats && !key[8]) {
       return ParsePlayerSource(key[7] - '1', value);
@@ -599,6 +602,9 @@ static bool HandleIniConfig(int section, const char *key, char *value) {
       return true;
     } else if (StringEqualsNoCase(key, "DisplayPerfInTitle")) {
       return ParseBool(value, &g_config.display_perf_title);
+    } else if (StringEqualsNoCase(key, "DebugHud")) {
+      g_config.debug_hud = (int)strtol(value, (char **)NULL, 10);
+      return true;
     } else if (StringEqualsNoCase(key, "DisableFrameDelay")) {
       return ParseBool(value, &g_config.disable_frame_delay);
     } else if (StringEqualsNoCase(key, "EnableSnes9xOracle")) {
@@ -691,6 +697,10 @@ void ParseConfigFile(const char *filename) {
   for (int i = 0; i < kSnesHostPadSeats; ++i) s_player_src_seen[i] = false;
   g_config.gamepad_deadzone = SNES_CONFIG_DEFAULT_DEADZONE;
   g_config.display_aspect = kSnesDisplayAspect_Crt4x3;
+  /* Debug instrumentation is on by default for this port: the status bar
+   * shows the recompiled vs interpreted share, and the panel adds the PC,
+   * registers, PPU and audio state. f cycles off / bar / full panel. */
+  g_config.debug_hud = 2;
   g_config.skip_launcher = false;
   /* Rewind's built-in ring, matching snes_rewind.c's own defaults so a host
    * that opts into the launcher rows starts from what it already had. */

@@ -74,6 +74,24 @@ static RomPatchStatus apply_ips(const uint8_t *source, size_t source_size,
         }
         uint32_t offset = be24(patch + at);
         at += 3;
+        if (offset == 0xffffffu) {
+            /* The classic IPS end marker: the three bytes that follow are the
+             * size the output is truncated or extended to. A patch that only
+             * rewrites bytes carries no size, and the image keeps the
+             * source's. */
+            if (patch_size - at >= 3) {
+                uint32_t extend = be24(patch + at);
+                at += 3;
+                if (extend > img->size) {
+                    if (!image_reserve(img, extend)) return kRomPatch_NoMemory;
+                    memset(img->data + img->size, 0, extend - img->size);
+                    img->size = extend;
+                } else if (extend < img->size) {
+                    img->size = extend;
+                }
+            }
+            break;
+        }
         if (patch_size - at < 2) return kRomPatch_Invalid;
         uint32_t size = be16(patch + at);
         at += 2;

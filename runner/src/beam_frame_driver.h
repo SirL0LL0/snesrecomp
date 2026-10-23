@@ -28,5 +28,15 @@ void snes_beam_frame_driver_draw_ppu_frame_observed(
     SnesBeamRasterObserver *observer, void *context);
 /* Forget the booted machine: the next frame starts from the reset vector. */
 void snes_beam_frame_driver_reset(void);
+/* A save state was restored: resume where the restored machine stands. */
+void snes_beam_frame_driver_state_loaded(void);
+/* The driver's own host state -- where the CPU half resumes, and whether it is
+ * halted on WAI -- for a title that saves it beside its snapshot. A guest blob
+ * alone does not carry it, so a load otherwise resumes the restored machine at
+ * the PC of the session it replaced. */
+#include <stdbool.h>
+#include <stdint.h>
+void snes_beam_frame_driver_get_resume(uint32_t *pc, bool *wai_halted);
+void snes_beam_frame_driver_set_resume(uint32_t pc, bool wai_halted);
 
 #endif /* SNESRECOMP_BEAM_FRAME_DRIVER_H */

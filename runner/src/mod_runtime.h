@@ -7,6 +7,7 @@
 #ifdef __cplusplus
 #include <filesystem>
 #include <string>
+#include <vector>
 
 #if defined(RECOMP_LAUNCHER)
 #include "recomp_launcher.h"
@@ -17,10 +18,17 @@ namespace SNESRecomp {
 /*
  * Initialize the package catalog rooted at <exe>/mods for one verified game.
  * The ROM digest is the canonical lowercase SHA-256 used by package targets.
+ *
+ * accepted_rom_sha256 carries the other dumps this title accepts: a title
+ * that ships a language pack takes the base ROM it was translated from as
+ * well as the image its code was generated from. The commit then follows
+ * the file the player picked, so the packages whose targets name that dump
+ * are the ones offered.
  */
 bool mod_runtime_initialize(const std::filesystem::path& root,
                             const std::string& game_id,
                             const std::string& rom_sha256,
+                            const std::vector<std::string>& accepted_rom_sha256 = {},
                             std::string* error = nullptr);
 
 /*
@@ -68,6 +76,13 @@ int snes_mod_runtime_initialize_c(const char* root,
  * (USA) (SHA-256 ...).") rather than reported only as wrong. */
 void snes_mod_runtime_set_rom_catalog_c(const SnesRomRevision* catalog,
                                         int count);
+/* Same, with the other dumps the title accepts (a base ROM a language pack
+ * turns into the image the code was generated from). */
+int snes_mod_runtime_initialize_multi_c(const char* root,
+                                         const char* game_id,
+                                         const char* rom_sha256,
+                                         const char* const* accepted_rom_sha256,
+                                         int num_accepted);
 int snes_mod_runtime_commit_c(const char* rom_path);
 void snes_mod_runtime_activate_plugins_c(void);
 const struct RecompLauncherCModProvider*

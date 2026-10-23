@@ -382,13 +382,18 @@ static void OpenGLRenderer_EndDraw(void) {
 
   /* The framework's own aspect maths, rather than a per-game copy: it knows
    * all three pixel aspects the config offers, and centres on both axes. */
+  /* A native hires texture (host_main.c) covers the viewport of its logical
+   * width, not twice it. */
+  extern int g_present_logical_width;
+  const int logical_width =
+      g_present_logical_width > 0 ? g_present_logical_width : g_draw_width;
   SnesDisplayViewport viewport;
   SnesDisplayAspect_ComputeViewport(
-      g_draw_width, g_draw_height, drawable_width, drawable_height,
+      logical_width, g_draw_height, drawable_width, drawable_height,
       SnesDisplayAspect_Clamp(g_config.display_aspect),
       g_config.ignore_aspect_ratio, false, &viewport);
   if (g_compute_viewport)
-    g_compute_viewport(g_draw_width, g_draw_height, drawable_width, drawable_height, &viewport);
+    g_compute_viewport(logical_width, g_draw_height, drawable_width, drawable_height, &viewport);
 
   glBindTexture(GL_TEXTURE_2D, g_texture.gl_texture);
   if (g_draw_width == g_texture.width && g_draw_height == g_texture.height) {

@@ -501,3 +501,4 @@ enum {
 
   kJoypadH_AnyDir = 0xf,
 };
+;

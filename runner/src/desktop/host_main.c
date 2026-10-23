@@ -83,6 +83,7 @@
 
 #if defined(RECOMP_LAUNCHER)
 #include "recomp_launcher.h"   /* recomp_launcher_run_window() */
+#include "recomp_runtime_ui.h" /* SnesDesktopHostGame.in_game_menu */
 #include "launcher_video.h"
 #include "launcher_profile.h"  /* launcher_profile_apply("snes", &gi) */
 /* The shared presentation blend is recomp-ui's (src/recomp_frame_blend.h,
@@ -190,6 +191,22 @@ struct SpcPlayer *g_spc_player;
  * runs guest code in the middle of it). Sized for the runner's maximum
  * side-space budget. */
 static uint8_t g_my_pixels[kPpuBufWidth * 4 * 240];
+/* Mode 5/6 rasterize two dots per logical SNES pixel. Keep that 512-dot
+ * field separate from the 256-pixel host frame so hires transitions do not
+ * resize the game window or change the frontend's logical resolution. */
+static uint8_t g_ppu_pixels[kPpuBufWidth * 4 * 240];
+static int g_ppu_render_width = 256;
+/* Width of the field FinalizePpuFrame last completed. The present shows that
+ * field at its native width: averaging a 512-dot field down to 256 halves
+ * every one-dot stroke of the hires font into a ghost of itself, which read
+ * as doubled, blurred lines on Secret of Mana's menus. g_ppu_render_width
+ * cannot stand in for it, because PreparePpuFrame recomputes that from the
+ * current mode before the present runs. */
+static int g_field_width = 256;
+/* Logical width the renderers fit to the window: a hires field is uploaded
+ * at 512 texels but covers the same viewport as a 256-pixel frame. 0 means
+ * the uploaded width. */
+int g_present_logical_width;
 
 extern uint8_t g_ram[0x20000];
 
@@ -228,6 +245,18 @@ static int DecodeRomIdentity(uint8_t sha_out[32], uint32_t *crc_out) {
     v = (v << 4) | (uint32_t)n;
   }
   *crc_out = v;
+  return 1;
+}
+
+/* Parse one 64-hex SHA-256 digest. Returns 0 when the text is not a digest,
+ * which the caller reads as "cannot verify" rather than "verified". */
+static int ParseSha256Hex(const char *hex, uint8_t out[32]) {
+  if (!hex || strlen(hex) != 64) return 0;
+  for (int i = 0; i < 32; i++) {
+    int hi = HexNibble(hex[i * 2]), lo = HexNibble(hex[i * 2 + 1]);
+    if (hi < 0 || lo < 0) return 0;
+    out[i] = (uint8_t)((hi << 4) | lo);
+  }
   return 1;
 }
 
@@ -667,6 +696,50 @@ static void RendererApply(int choice) {
   }
 }
 
+/* Per-frame stats on the console (and in debug.log beside the exe). The HUD
+ * overlay is optional, but the record of what the guest did is not: a headless
+ * run has no other way to show where the frame time, the guest PC and the PPU
+ * state went. */
+static FILE *g_debug_log_file = NULL;
+static double g_debug_log_last = 0.0;
+
+static void DebugLogInit(void) {
+  const char *path = HostGetenv("DEBUG_LOG");
+  if (!path) path = "debug.log";
+  if (!path[0] || strcmp(path, "0") == 0) return;
+  g_debug_log_file = fopen(path, "w");
+  if (g_debug_log_file)
+    fprintf(g_debug_log_file, "# frame sim_ms pc24 function inidisp tm ts vram\n");
+}
+
+static void DebugLogFrame(double sim_ms) {
+  if (!g_ppu || !g_snes) return;
+  const double now = MonotonicSeconds();
+  if (now - g_debug_log_last < 1.0) return;
+  g_debug_log_last = now;
+  const unsigned frame = g_present_frame;
+  extern const char *g_last_recomp_func;
+  const char *fn = g_last_recomp_func ? g_last_recomp_func : "(none)";
+  extern uint32_t interp_bridge_last_exit_pc(void);
+  const uint32_t pc = interp_bridge_last_exit_pc();
+  fprintf(stderr,
+          "[dbg] f=%u sim=%.1fms ipc=%02X:%04X fn=%s "
+          "inidisp=%02X tm=%02X ts=%02X vram=%u\n",
+          frame, sim_ms, (pc >> 16) & 0xFF, pc & 0xFFFF, fn,
+          (unsigned)g_ppu->inidisp, (unsigned)g_ppu->screenEnabled[0],
+          (unsigned)g_ppu->screenEnabled[1],
+          (unsigned)g_ppu->vramWriteCount);
+  if (g_debug_log_file) {
+    fprintf(g_debug_log_file,
+            "%u %.2f %06X %s %02X %02X %02X %u\n",
+            frame, sim_ms, pc, fn, (unsigned)g_ppu->inidisp,
+            (unsigned)g_ppu->screenEnabled[0],
+            (unsigned)g_ppu->screenEnabled[1],
+            (unsigned)g_ppu->vramWriteCount);
+    fflush(g_debug_log_file);
+  }
+}
+
 static void PreparePpuFrame(void) {
   int drawable_width = 0, drawable_height = 0;
   if (g_renderer_funcs.GetOutputSize)
@@ -683,6 +756,11 @@ static void PreparePpuFrame(void) {
 
   int fw = g_game->frame_width > 0 ? g_game->frame_width : 256;
   int fh = g_game->frame_height > 0 ? g_game->frame_height : 224;
+  int render_fw = fw;
+  /* Modes 5/6 produce 512 PPU dots for the same 256-pixel SNES viewport. */
+  if (!g_game->native_widescreen && g_ppu &&
+      (((g_ppu->bgmode & 7) == 5) || ((g_ppu->bgmode & 7) == 6)))
+    render_fw = 512;
   if (g_game->prepare_frame)
     g_game->prepare_frame(drawable_width, drawable_height, &fw, &fh);
   int max_width = g_game->native_widescreen ? kPpuBufWidth : kSnesDesktopMaxFrameWidth;
@@ -690,6 +768,7 @@ static void PreparePpuFrame(void) {
   if (fh <= 0 || fh > 240) fh = 224;
   g_snes_width = fw;
   g_snes_height = fh;
+  g_ppu_render_width = render_fw;
   /* Native widescreen ports rasterize directly into the widened field. */
   g_ws_extra = g_game->native_widescreen ? (fw - 256) / 2 : 0;
   g_ws_active = g_ws_extra != 0;
@@ -708,9 +787,38 @@ static void PreparePpuFrame(void) {
    * PPU never saw, so those ports always ran the reference rasteriser. */
   uint32 flags = g_ppu_render_flags;
   if (g_ws_active) flags |= kPpuRenderFlags_NewRenderer;
-  PpuBeginDrawing(g_ppu, g_my_pixels,
-                  (g_game->native_widescreen ? fw : 256) * 4, flags);
+  PpuBeginDrawing(g_ppu, g_ppu_pixels, render_fw * 4, flags);
   PpuSetExtraSpace(g_ppu, (uint8)g_ws_extra);
+}
+
+/* Convert the completed PPU field to the stable host viewport. In hires
+ * modes each logical pixel is a subscreen/main-screen dot pair; averaging
+ * the pair keeps a 256-wide copy for thumbnails, rewind and title-owned
+ * compositors. The window itself shows the native field (g_field_width). */
+static void FinalizePpuFrame(void) {
+  const int out_w = g_snes_width;
+  const int in_w = g_ppu_render_width;
+  if (out_w <= 0 || in_w <= 0 || g_snes_height <= 0) return;
+  g_field_width = in_w;
+  for (int y = 0; y < g_snes_height; y++) {
+    const uint8_t *src = g_ppu_pixels + (size_t)y * in_w * 4;
+    uint8_t *dst = g_my_pixels + (size_t)y * out_w * 4;
+    if (in_w == out_w) {
+      memcpy(dst, src, (size_t)out_w * 4);
+      continue;
+    }
+    for (int x = 0; x < out_w; x++) {
+      const int x0 = (int)((int64_t)x * in_w / out_w);
+      const int x1 = (int)((int64_t)(x + 1) * in_w / out_w);
+      const int samples = IntMax(x1 - x0, 1);
+      for (int c = 0; c < 3; c++) {
+        unsigned sum = 0;
+        for (int sx = x0; sx < x1; sx++) sum += src[sx * 4 + c];
+        dst[x * 4 + c] = (uint8_t)((sum + samples / 2) / samples);
+      }
+      dst[x * 4 + 3] = 0;
+    }
+  }
 }
 
 // --- Scripted input ---
@@ -744,7 +852,9 @@ enum {
   kScriptDump      = 0x04000000u,
   kScriptQuit      = 0x02000000u,
   kScriptHostControl = 0x01000000u,
-  kScriptZeroFrame = kScriptUntil | kScriptDump | kScriptQuit | kScriptHostControl,
+  kScriptSaveState = 0x00800000u,
+  kScriptZeroFrame = kScriptUntil | kScriptDump | kScriptQuit | kScriptHostControl |
+                     kScriptSaveState,
 };
 static int g_script_quit;        // quit reached: the main loop exits
 static int g_script_failed;      // an until timed out: exit code 3
@@ -871,6 +981,7 @@ static ScriptEntry *NewScriptEntry(int *cap) {
  *   press <buttons> [N]     hold a+b+... for N frames (default 1)
  *                           prefix P2 buttons with p2:, e.g. right+p2:right
  *   loadstate N             load save-state slot N
+ *   savestate N             save slot N at this frame boundary
  *   reset                   the Reset hotkey's console reset
  *   turbo on|off            change the held-Turbo state at this frame boundary
  *   renderer toggle         invoke the renderer hotkey at this boundary
@@ -927,6 +1038,13 @@ static void LoadScript(const char *path) {
       ScriptEntry *e = NewScriptEntry(&cap);
       e->mask = kScriptHostControl;
       e->host_command = kKeys_ToggleRenderer;
+      e->wait_frames = pending_wait;
+      pending_wait = 0;
+    } else if (strcmp(cmd, "savestate") == 0) {
+      int slot = 0;
+      sscanf(line, "%*s %d", &slot);
+      ScriptEntry *e = NewScriptEntry(&cap);
+      e->mask = kScriptSaveState | (slot & 0xF);
       e->wait_frames = pending_wait;
       pending_wait = 0;
     } else if (strcmp(cmd, "loadstate") == 0) {
@@ -1046,8 +1164,16 @@ static bool ScriptCondHolds(const ScriptEntry *e) {
 
 static void ScriptDump(const char *tag, unsigned frame) {
   const char *dir = getenv("SNESRECOMP_DUMP_DIR");
-  const int pitch = (g_game->native_widescreen ? g_snes_width : 256) * 4;
-  int rc = snes_state_dump(dir ? dir : "", tag, g_my_pixels, pitch, g_ws_extra,
+  /* Hires modes (5/6) rasterize into a 512-dot field; the finalized host
+   * viewport is the averaged 256-dot version.  Dump the native field when it
+   * is wider so diagnostics are not mistaken for a doubled picture. */
+  const uint8_t *src = g_my_pixels;
+  int pitch = g_snes_width * 4;
+  if (g_ppu && g_ppu_render_width > g_snes_width) {
+    src = g_ppu_pixels;
+    pitch = g_ppu_render_width * 4;
+  }
+  int rc = snes_state_dump(dir ? dir : "", tag, src, pitch, g_ws_extra,
                            g_snes_height, frame);
   fprintf(stderr, "script f=%u dump %s %s\n", frame, tag, rc ? "partial" : "ok");
 }
@@ -1094,6 +1220,9 @@ static uint32 TickScript(void) {
         g_turbo = (e->mask & 1u) != 0;
         fprintf(stderr, "script f=%u turbo %s\n", frame, g_turbo ? "on" : "off");
       }
+    } else if (e->mask & kScriptSaveState) {
+      RtlSaveLoad(kSaveLoad_Save, (int)(e->mask & 0xF));
+      fprintf(stderr, "script f=%u savestate %u\n", frame, e->mask & 0xF);
     } else {
       fprintf(stderr, "script f=%u quit\n", frame);
       g_script_quit = 1;
@@ -1263,8 +1392,10 @@ static SDL_HitTestResult HitTestCallback(SDL_Window *win, const SDL_Point *pt, v
 static void CaptureSimulationFrame(unsigned number) {
   PreparePpuFrame();
   if (g_game->begin_sim_frame) g_game->begin_sim_frame(number);
-  if (g_rtl_game_info && g_rtl_game_info->draw_ppu_frame)
+  if (g_rtl_game_info && g_rtl_game_info->draw_ppu_frame) {
     g_rtl_game_info->draw_ppu_frame();
+    FinalizePpuFrame();
+  }
   if (g_game->end_sim_frame) g_game->end_sim_frame(g_my_pixels, number);
 }
 
@@ -1311,8 +1442,8 @@ static int ComposeStateThumbnail(uint32_t *dst, size_t cap, int *w, int *h) {
 static void NoteStateFrame(void) {
   if (g_ppu && g_ppu->renderBuffer) {
     int width = g_game->native_widescreen ? g_snes_width : 256;
-    snes_savestate_menu_note_frame((const uint32_t *)g_ppu->renderBuffer, width, g_snes_height);
-    snes_rewind_note_framebuffer((const uint32_t *)g_ppu->renderBuffer, width, g_snes_height);
+    snes_savestate_menu_note_frame((const uint32_t *)g_my_pixels, width, g_snes_height);
+    snes_rewind_note_framebuffer((const uint32_t *)g_my_pixels, width, g_snes_height);
   }
   snes_rewind_note_frame();
 }
@@ -1333,6 +1464,10 @@ void RtlDrawPpuFrame(uint8 *pixel_buffer, size_t pitch, uint32 render_flags) {
     return;
   }
   debug_server_note_composed_frame(NULL, 0, 0, 0);
+  if (g_present_logical_width > 0 && g_field_width > g_snes_width) {
+    RtlWidescreenPresent(pixel_buffer, pitch, g_ppu_pixels, g_field_width, g_snes_height);
+    return;
+  }
   RtlWidescreenPresent(pixel_buffer, pitch, g_my_pixels, g_snes_width, g_snes_height);
 }
 
@@ -1407,8 +1542,21 @@ static void DrawPpuFrameWithPerf(void) {
   const int render_scale = 1;
   uint8 *present_buffer = 0;
   int present_pitch = 0;
+  /* A hires field is presented at its native 512 dots, fitted to the same
+   * viewport as a 256-pixel frame (g_present_logical_width). Title-owned
+   * compositors and the widescreen field keep the 256-wide copy, and so does
+   * frame blending, whose kept frame cannot change width between presents. */
+  const bool native_hires =
+      g_field_width > g_snes_width && !g_game->draw_frame && !g_ws_active &&
+      !g_game->native_widescreen
+#if defined(SNESRECOMP_HOST_HAS_BLEND)
+      && !g_config.frame_blend
+#endif
+      ;
+  const int present_w = (native_hires ? g_field_width : g_snes_width) * render_scale;
+  g_present_logical_width = native_hires ? g_snes_width * render_scale : 0;
 
-  g_renderer_funcs.BeginDraw(g_snes_width * render_scale,
+  g_renderer_funcs.BeginDraw(present_w,
                              g_snes_height * render_scale,
                              &present_buffer, &present_pitch);
   ProfileEnd(kProfileAcquire, profile_start);
@@ -1425,7 +1573,7 @@ static void DrawPpuFrameWithPerf(void) {
   uint8 *pixel_buffer = present_buffer;
   int pitch = present_pitch;
 #if defined(SNESRECOMP_HOST_HAS_BLEND) || SNESRECOMP_FRAME_STAGING_HLE
-  const size_t frame_bytes = (size_t)(g_snes_width * render_scale) *
+  const size_t frame_bytes = (size_t)(present_w) *
                              (size_t)(g_snes_height * render_scale) * 4u;
   bool staged = SNESRECOMP_FRAME_STAGING_HLE &&
                 frame_bytes <= sizeof(g_frame_stage);
@@ -1436,7 +1584,7 @@ static void DrawPpuFrameWithPerf(void) {
 #endif
   if (staged) {
     pixel_buffer = g_frame_stage;
-    pitch = g_snes_width * render_scale * 4;
+    pitch = present_w * 4;
   }
 #endif
 
@@ -1457,7 +1605,7 @@ static void DrawPpuFrameWithPerf(void) {
    * never reached 1 across 2,481 presents, so every frame came out identical
    * with the setting on and off while the launcher reported it on. */
   if (blending) {
-    const int w = g_snes_width * render_scale, h = g_snes_height * render_scale;
+    const int w = present_w, h = g_snes_height * render_scale;
     if (g_present_frame != g_blend_frame) {
       recomp_frame_blend_apply(g_blend, pixel_buffer, w, h, (size_t)pitch);
       g_blend_frame = g_present_frame;
@@ -1484,22 +1632,22 @@ static void DrawPpuFrameWithPerf(void) {
    * save-state browser was opened. */
   {
     const int rows = g_snes_height * render_scale;
-    const int row_bytes = g_snes_width * render_scale * 4;
+    const int row_bytes = present_w * 4;
     if (rows > 0 && row_bytes > 0 &&
         (size_t)rows * (size_t)row_bytes <= sizeof(g_frozen_frame)) {
       for (int y = 0; y < rows; y++)
         memcpy(g_frozen_frame + (size_t)y * (size_t)row_bytes,
                pixel_buffer + (size_t)y * (size_t)pitch, (size_t)row_bytes);
-      g_frozen_w = g_snes_width * render_scale;
+      g_frozen_w = present_w;
       g_frozen_h = rows;
     }
   }
-  ComposeOsd(pixel_buffer, pitch, g_snes_width * render_scale,
+  ComposeOsd(pixel_buffer, pitch, present_w,
              g_snes_height * render_scale, 2);
   /* Use the same completed simulation index as the common WRAM dumper. */
   const uint32 dump_frame = snes_frame_counter ? snes_frame_counter - 1 : 0;
   FrameDump_Present(dump_frame, pixel_buffer, pitch,
-                    g_snes_width * render_scale, g_snes_height * render_scale);
+                    present_w, g_snes_height * render_scale);
   FrameDump_Ppu(dump_frame, g_ppu);
   /* SNESRECOMP_SCREENSHOT=<path.ppm> [SNESRECOMP_SCREENSHOT_FRAME=<n>]: write
    * the frame presented at simulated frame n (default: the first) as a PPM,
@@ -1516,7 +1664,7 @@ static void DrawPpuFrameWithPerf(void) {
     }
     const char *path = shot_done ? NULL : HostGetenv("SCREENSHOT");
     if (path && (long)g_present_frame >= shot_frame) {
-      WritePpm(path, pixel_buffer, pitch, g_snes_width * render_scale,
+      WritePpm(path, pixel_buffer, pitch, present_w,
                g_snes_height * render_scale, g_present_frame, true);
       shot_done = 1;
     }
@@ -1555,7 +1703,7 @@ static void DrawPpuFrameWithPerf(void) {
     if ((dir || log_path) && (long)g_present_frame >= from &&
         (long)g_present_frame <= to) {
       char path[1024];
-      const int w = g_snes_width * render_scale, h = g_snes_height * render_scale;
+      const int w = present_w, h = g_snes_height * render_scale;
       if (!csv) {
         if (log_path) snprintf(path, sizeof(path), "%s", log_path);
         else snprintf(path, sizeof(path), "%s/presents.csv", dir);
@@ -1594,7 +1742,7 @@ static void DrawPpuFrameWithPerf(void) {
    * pattern write-combined memory is good at. */
   if (staged) {
     const int rows = g_snes_height * render_scale;
-    const int row_bytes = g_snes_width * render_scale * 4;
+    const int row_bytes = present_w * 4;
     for (int y = 0; y < rows; y++)
       memcpy(present_buffer + (size_t)y * (size_t)present_pitch,
              pixel_buffer + (size_t)y * (size_t)pitch, (size_t)row_bytes);
@@ -1969,6 +2117,10 @@ static void OverlaySelftestPadTick(unsigned pump) {
  * shapes: the save-state browser is an opaque full-rect panel, the rewind
  * filmstrip belongs across the bottom third of the frame, annotating the
  * moment it describes. */
+/* The in-game menu's compositor (SnesDesktopHostGame.in_game_menu); draws
+ * nothing while the menu is closed. Defined with the menu below. */
+static void RuntimeMenuCompose(uint8 *pixels, int pitch, int w, int h);
+
 static void PresentFrozenWithOverlay(void) {
   const uint32_t *panel = NULL;
   int pw = 0, ph = 0;
@@ -1976,19 +2128,22 @@ static void PresentFrozenWithOverlay(void) {
   if (!is_menu && !(snes_rewind_overlay_image(&panel, &pw, &ph) && panel))
     panel = NULL;
 
-  /* The draw buffer is the FROZEN FRAME at twice its size, whichever panel
+  /* The draw buffer is the LOGICAL FIELD at twice its size, whichever panel
    * is up. It used to be the panel's own size, which is right for the
    * browser (512x448, exactly twice the field) and wrong for the rewind
    * filmstrip, whose image is a 512x176 strip: the whole frozen game was
    * squashed into a strip-high buffer and presented letterboxed in the
-   * middle of the window. */
-  const int base_w = g_frozen_w > 0 ? g_frozen_w : g_snes_width;
+   * middle of the window. Logical, not the frozen frame's own width: a hires
+   * field is frozen at its native 512 dots, and doubling that squeezed every
+   * panel to half its width on screen. */
+  const int base_w = g_snes_width;
   const int base_h = g_frozen_h > 0 ? g_frozen_h : g_snes_height;
   const int draw_w = base_w * 2;
   const int draw_h = base_h * 2;
   uint8 *pixel_buffer = 0;
   int pitch = 0;
 
+  g_present_logical_width = 0;
   g_renderer_funcs.BeginDraw(draw_w, draw_h, &pixel_buffer, &pitch);
   if (!pixel_buffer) {
     g_renderer_funcs.EndDraw();
@@ -2017,6 +2172,7 @@ static void PresentFrozenWithOverlay(void) {
                                0, draw_h - strip_h, draw_w, strip_h);
     }
   }
+  RuntimeMenuCompose(pixel_buffer, pitch, draw_w, draw_h);
   ComposeOsd(pixel_buffer, pitch, draw_w, draw_h, draw_w >= 512 ? 1 : 2);
   /* SNESRECOMP_OVERLAY_DUMP=<path> (browser) / SNESRECOMP_REWIND_DUMP=<path>
    * (filmstrip): write the composited overlay frame as a PPM. The overlays can only be driven by a human, so this is the only way
@@ -2383,12 +2539,14 @@ static void SdlRenderer_BeginDraw(int width, int height, uint8 **pixels, int *pi
   snesrecomp_sdl_set_texture_opaque(g_texture);
   int output_width = 0, output_height = 0;
   SdlRenderer_GetOutputSize(&output_width, &output_height);
+  /* A native hires texture covers the viewport of its logical width. */
+  const int logical_width = g_present_logical_width > 0 ? g_present_logical_width : width;
   SnesDisplayViewport viewport;
-  SnesDisplayAspect_ComputeViewport(width, height, output_width, output_height,
+  SnesDisplayAspect_ComputeViewport(logical_width, height, output_width, output_height,
                                     SnesDisplayAspect_Clamp(g_config.display_aspect),
                                     g_config.ignore_aspect_ratio, false, &viewport);
   if (g_game->compute_viewport)
-    g_game->compute_viewport(width, height, output_width, output_height, &viewport);
+    g_game->compute_viewport(logical_width, height, output_width, output_height, &viewport);
   g_sdl_present_rect.x = viewport.x;
   g_sdl_present_rect.y = viewport.y;
   g_sdl_present_rect.w = viewport.width;
@@ -2685,10 +2843,35 @@ static int FindRomBesideExe(char *out, size_t cap) {
 /* ── The launcher, before boot and mid-game ──────────────────────────────── */
 
 /* The ROM this binary was generated from. File scope because both launcher
- * entries hand it to recomp-ui, and the console resolver checks against it. */
+ * entries hand it to recomp-ui, and the console resolver checks against it.
+ *
+ * g_rom_sha256s holds the whole accepted set: the digest the code was
+ * generated from first, then the extra digests the title declares (a base
+ * ROM that a language pack turns into that image in memory). */
+#define ROM_SHA256_MAX 8
 static uint8_t g_rom_sha256[32];
+static uint8_t g_rom_sha256s[ROM_SHA256_MAX][32];
+static int g_rom_num_sha256s;
 static uint32_t g_rom_crc32;
 static int g_rom_identity_ok;
+
+/* The digests this title accepts: the one the code was generated from, then
+ * the extra ones the title declares (a base ROM a language pack turns into
+ * that image in memory). Fills g_rom_sha256s and returns its size. */
+static int CollectRomSha256s(void) {
+  int n = 0;
+  if (g_rom_identity_ok && n < ROM_SHA256_MAX) {
+    memcpy(g_rom_sha256s[n++], g_rom_sha256, 32);
+  }
+  const char *const *extra = g_game->known_sha256_hex;
+  int num_extra = g_game->num_known_sha256;
+  for (int i = 0; i < num_extra && n < ROM_SHA256_MAX; i++) {
+    uint8_t digest[32];
+    if (!ParseSha256Hex(extra[i], digest)) continue;
+    memcpy(g_rom_sha256s[n++], digest, 32);
+  }
+  return n;
+}
 static const char *g_program_path;       /* argv[0]: keybinds.ini sits beside it */
 static const char *g_rom_path = "";      /* the running ROM, once resolved */
 
@@ -2922,9 +3105,9 @@ static void LauncherSeed(RecompLauncherCSettings *ls, RecompLauncherCGameInfo *g
   gi->num_players = game->num_players > 0 ? game->num_players : 1;
   gi->expected_crc = g_rom_crc32;
   gi->has_expected_crc = g_rom_identity_ok;
-  gi->known_sha256 = g_rom_identity_ok
-      ? (const uint8_t (*)[32])&g_rom_sha256 : NULL;
-  gi->num_known_sha256 = g_rom_identity_ok ? 1 : 0;
+  gi->known_sha256 = g_rom_num_sha256s
+      ? (const uint8_t (*)[32])g_rom_sha256s : NULL;
+  gi->num_known_sha256 = g_rom_num_sha256s;
   /* Additive: a title catalogued by SHA-1 sets these instead of, or as
    * well as, the SHA-256 above. */
   gi->known_sha1_hex = game->known_sha1_hex;
@@ -3145,6 +3328,284 @@ static const char *RestartReason(const Config *before, const char *rom,
 }
 #endif /* RECOMP_LAUNCHER */
 
+/* ── In-game menu (SnesDesktopHostGame.in_game_menu) ─────────────────────────
+ * recomp-ui's runtime menu over the frozen game. It is modal like the
+ * save-state browser -- the guest does not run while it is open, so "Save
+ * state" saves a definite point in time -- and it draws through the
+ * renderer-agnostic ARGB8888 presentation into the overlay frame, so it needs
+ * no ImGui backend for SDL3 or OpenGL. Every accepted change is applied live
+ * and written to config.ini at once. */
+static int g_runtime_menu_hotkey;
+static PadGesture g_menu_gesture;
+#if defined(RECOMP_LAUNCHER)
+static RecompRuntimeUi *g_runtime_ui;
+static int g_runtime_ui_slot = 1;
+static int g_runtime_ui_dim = RECOMP_RUNTIME_UI_DEFAULT_DIM_PERCENT;
+static int g_runtime_ui_opacity = 100;
+static bool *g_runtime_ui_running;
+
+static int RuntimeMenuIs(const RecompRuntimeUiItem *item, const char *key) {
+  return item && item->key && !strcmp(item->key, key);
+}
+
+static int RuntimeMenuGet(void *context, const RecompRuntimeUiItem *item, int *value) {
+  (void)context;
+  if (RuntimeMenuIs(item, RECOMP_RUNTIME_UI_KEY_FULLSCREEN))
+    *value = (g_win_flags & SNESRECOMP_SDL_WINDOW_FULLSCREEN_DESKTOP) ? 1 : 0;
+  else if (RuntimeMenuIs(item, RECOMP_RUNTIME_UI_KEY_WINDOW_SCALE))
+    *value = g_current_window_scale ? g_current_window_scale : 1;
+  else if (RuntimeMenuIs(item, RECOMP_RUNTIME_UI_KEY_LINEAR_FILTER))
+    *value = g_config.linear_filtering ? 1 : 0;
+  else if (RuntimeMenuIs(item, RECOMP_RUNTIME_UI_KEY_VOLUME))
+    *value = g_config.volume;
+  else if (RuntimeMenuIs(item, RECOMP_RUNTIME_UI_KEY_MENU_DIM))
+    *value = g_runtime_ui_dim;
+  else if (RuntimeMenuIs(item, RECOMP_RUNTIME_UI_KEY_MENU_OPACITY))
+    *value = g_runtime_ui_opacity;
+  else if (RuntimeMenuIs(item, RECOMP_RUNTIME_UI_KEY_STATE_SLOT))
+    *value = g_runtime_ui_slot;
+  else
+    return 0;
+  return 1;
+}
+
+static int RuntimeMenuSet(void *context, const RecompRuntimeUiItem *item, int value) {
+  (void)context;
+  if (RuntimeMenuIs(item, RECOMP_RUNTIME_UI_KEY_FULLSCREEN)) {
+    /* The Alt+Enter path: windowed <-> borderless, kept in the config. */
+    const bool want = value != 0;
+    if (want != ((g_win_flags & SNESRECOMP_SDL_WINDOW_FULLSCREEN_DESKTOP) != 0))
+      HandleCommand(kKeys_Fullscreen, true);
+  } else if (RuntimeMenuIs(item, RECOMP_RUNTIME_UI_KEY_WINDOW_SCALE)) {
+    ChangeWindowScale(value - (int)g_current_window_scale);
+    g_config.window_scale = g_current_window_scale;
+  } else if (RuntimeMenuIs(item, RECOMP_RUNTIME_UI_KEY_LINEAR_FILTER)) {
+    g_config.linear_filtering = value != 0;
+    if (g_texture) snesrecomp_sdl_set_texture_linear(g_texture, g_config.linear_filtering);
+  } else if (RuntimeMenuIs(item, RECOMP_RUNTIME_UI_KEY_VOLUME)) {
+    g_config.volume = value;
+    ApplyVolume();
+    g_volume_changed = true;
+  } else if (RuntimeMenuIs(item, RECOMP_RUNTIME_UI_KEY_MENU_DIM) ||
+             RuntimeMenuIs(item, RECOMP_RUNTIME_UI_KEY_MENU_OPACITY)) {
+    if (RuntimeMenuIs(item, RECOMP_RUNTIME_UI_KEY_MENU_DIM)) g_runtime_ui_dim = value;
+    else g_runtime_ui_opacity = value;
+    recomp_runtime_ui_set_backdrop(g_runtime_ui, g_runtime_ui_dim / 100.0f,
+                                   g_runtime_ui_opacity / 100.0f);
+  } else if (RuntimeMenuIs(item, RECOMP_RUNTIME_UI_KEY_STATE_SLOT)) {
+    g_runtime_ui_slot = value;
+  } else {
+    return 0;
+  }
+  return 1;
+}
+
+static int RuntimeMenuAction(void *context, const RecompRuntimeUiItem *item) {
+  (void)context;
+  static char status[64];
+  if (RuntimeMenuIs(item, RECOMP_RUNTIME_UI_KEY_RESUME)) {
+    recomp_runtime_ui_close(g_runtime_ui);
+    return 1;
+  }
+  if (RuntimeMenuIs(item, RECOMP_RUNTIME_UI_KEY_SAVE_STATE)) {
+    /* Slots are 1-based in the menu, 0-based for RtlSaveLoad (F1 = slot 0). */
+    RtlSaveLoad(kSaveLoad_Save, g_runtime_ui_slot - 1);
+    snprintf(status, sizeof(status), "Saved to slot %d", g_runtime_ui_slot);
+    recomp_runtime_ui_set_status(g_runtime_ui, status);
+    return 0;
+  }
+  if (RuntimeMenuIs(item, RECOMP_RUNTIME_UI_KEY_LOAD_STATE)) {
+    RtlSaveLoad(kSaveLoad_Load, g_runtime_ui_slot - 1);
+    GameReset();
+    recomp_runtime_ui_close(g_runtime_ui);
+    return 1;
+  }
+  if (RuntimeMenuIs(item, RECOMP_RUNTIME_UI_KEY_RESET)) {
+    if (!recomp_runtime_ui_confirm(g_runtime_ui, item, "Press again to reset"))
+      return 0;
+    ConsoleReset();
+    recomp_runtime_ui_close(g_runtime_ui);
+    return 1;
+  }
+  if (RuntimeMenuIs(item, RECOMP_RUNTIME_UI_KEY_RETURN_TO_LAUNCHER)) {
+    /* The main loop opens it once the menu has closed. */
+    g_open_launcher_hotkey = 1;
+    recomp_runtime_ui_close(g_runtime_ui);
+    return 1;
+  }
+  if (RuntimeMenuIs(item, RECOMP_RUNTIME_UI_KEY_QUIT)) {
+    if (g_runtime_ui_running) *g_runtime_ui_running = false;
+    recomp_runtime_ui_close(g_runtime_ui);
+    return 1;
+  }
+  return 0;
+}
+
+static void RuntimeMenuSave(void *context) {
+  (void)context;
+  if (g_active_config_file) WriteConfigFile(g_active_config_file);
+}
+
+static void RuntimeMenuCreate(const SnesDesktopHostGame *game) {
+  RecompRuntimeUiStandardConfig standard;
+  memset(&standard, 0, sizeof(standard));
+  standard.menu.title = game->display_name ? game->display_name : "Settings";
+  standard.menu.subtitle = "Paused";
+  standard.menu.theme = "snes";
+  standard.menu.accept_label = "A";
+  standard.menu.back_label = "B";
+  standard.menu.callbacks.get_value = RuntimeMenuGet;
+  standard.menu.callbacks.set_value = RuntimeMenuSet;
+  standard.menu.callbacks.run_action = RuntimeMenuAction;
+  standard.menu.callbacks.save = RuntimeMenuSave;
+  standard.features =
+      RECOMP_RUNTIME_UI_STANDARD_RESUME | RECOMP_RUNTIME_UI_STANDARD_STATE_SLOT |
+      RECOMP_RUNTIME_UI_STANDARD_SAVE_STATE | RECOMP_RUNTIME_UI_STANDARD_LOAD_STATE |
+      RECOMP_RUNTIME_UI_STANDARD_RESET | RECOMP_RUNTIME_UI_STANDARD_FULLSCREEN |
+      RECOMP_RUNTIME_UI_STANDARD_WINDOW_SCALE | RECOMP_RUNTIME_UI_STANDARD_LINEAR_FILTER |
+      RECOMP_RUNTIME_UI_STANDARD_VOLUME | RECOMP_RUNTIME_UI_STANDARD_MENU_BACKDROP |
+      RECOMP_RUNTIME_UI_STANDARD_QUIT;
+  if (game->in_game_launcher)
+    standard.features |= RECOMP_RUNTIME_UI_STANDARD_RETURN_TO_LAUNCHER;
+  standard.window_scale_max = kMaxWindowScale;
+  standard.state_slot_count = 10;   /* the F1-F10 slots */
+  g_runtime_ui = recomp_runtime_ui_create_standard(&standard);
+  if (!g_runtime_ui) {
+    host_report_breadcrumb("in-game menu: could not be created");
+    return;
+  }
+  recomp_runtime_ui_set_backdrop(g_runtime_ui, g_runtime_ui_dim / 100.0f,
+                                 g_runtime_ui_opacity / 100.0f);
+}
+
+static void RuntimeMenuCompose(uint8 *pixels, int pitch, int w, int h) {
+  if (g_runtime_ui && recomp_runtime_ui_is_open(g_runtime_ui))
+    recomp_runtime_ui_render_argb8888(g_runtime_ui, pixels, w, h, pitch);
+}
+
+static void RuntimeMenuKeyDown(int key, int repeat) {
+  RecompRuntimeUiInput input;
+  switch (key) {
+  case SDLK_UP:        input = RECOMP_RUNTIME_UI_INPUT_UP; break;
+  case SDLK_DOWN:      input = RECOMP_RUNTIME_UI_INPUT_DOWN; break;
+  case SDLK_LEFT:      input = RECOMP_RUNTIME_UI_INPUT_LEFT; break;
+  case SDLK_RIGHT:     input = RECOMP_RUNTIME_UI_INPUT_RIGHT; break;
+  case SDLK_RETURN: case SDLK_KP_ENTER: case SDLK_SPACE:
+                       input = RECOMP_RUNTIME_UI_INPUT_ACCEPT; break;
+  case SDLK_ESCAPE: case SDLK_BACKSPACE:
+                       input = RECOMP_RUNTIME_UI_INPUT_BACK; break;
+  default: return;
+  }
+  recomp_runtime_ui_handle_input(g_runtime_ui, input, 1, repeat);
+}
+
+/* The pad drives the menu from seat 0's input word, edge-triggered with a
+ * hold-to-repeat on the directions: D-pad moves and steps values, A accepts,
+ * B goes back a level (closing at the top), Start closes from anywhere. */
+static void RuntimeMenuPollPad(uint32 *prev, uint32 *held_since, uint32 *last_repeat) {
+  static const struct { uint32 bit; RecompRuntimeUiInput input; bool repeats; } kMap[] = {
+    { SNES_PAD_UP, RECOMP_RUNTIME_UI_INPUT_UP, true },
+    { SNES_PAD_DOWN, RECOMP_RUNTIME_UI_INPUT_DOWN, true },
+    { SNES_PAD_LEFT, RECOMP_RUNTIME_UI_INPUT_LEFT, true },
+    { SNES_PAD_RIGHT, RECOMP_RUNTIME_UI_INPUT_RIGHT, true },
+    { SNES_PAD_A, RECOMP_RUNTIME_UI_INPUT_ACCEPT, false },
+    { SNES_PAD_B, RECOMP_RUNTIME_UI_INPUT_BACK, false },
+    { SNES_PAD_START, RECOMP_RUNTIME_UI_INPUT_TOGGLE, false },
+  };
+  const uint32 now = SDL_GetTicks();
+  const uint32 pad = OverlayNavInputs();
+  const uint32 dirs = SNES_PAD_UP | SNES_PAD_DOWN | SNES_PAD_LEFT | SNES_PAD_RIGHT;
+  if ((pad & dirs) != (*prev & dirs)) { *held_since = now; *last_repeat = now; }
+  for (size_t i = 0; i < sizeof(kMap) / sizeof(kMap[0]); ++i) {
+    const bool down = (pad & kMap[i].bit) != 0;
+    const bool was = (*prev & kMap[i].bit) != 0;
+    if (down && !was) {
+      recomp_runtime_ui_handle_input(g_runtime_ui, kMap[i].input, 1, 0);
+    } else if (down && kMap[i].repeats && now - *held_since >= 350 &&
+               now - *last_repeat >= 80) {
+      recomp_runtime_ui_handle_input(g_runtime_ui, kMap[i].input, 1, 1);
+      *last_repeat = now;
+    }
+  }
+  *prev = pad;
+}
+
+/* Menu self-test (SNESRECOMP_MENU_SELFTEST=<frame>, off by default): opens the
+ * menu at <frame>, writes the top page and the first section as PPMs to
+ * SNESRECOMP_MENU_DUMP (<path>_top.ppm, <path>_section.ppm), steps back out
+ * and closes it with Start. The menu can only be driven by a human otherwise,
+ * so this is what shows it reaches the screen and lets the guest resume. */
+static long g_menu_selftest_frame = -2;
+static void RuntimeMenuSelftestDump(const char *suffix) {
+  const char *base = HostGetenv("MENU_DUMP");
+  if (!base) return;
+  const int w = g_snes_width * 2, h = (g_frozen_h > 0 ? g_frozen_h : g_snes_height) * 2;
+  uint32_t *buf = (uint32_t *)malloc((size_t)w * (size_t)h * 4);
+  if (!buf) return;
+  if (g_frozen_w > 0 && g_frozen_h > 0)
+    snes_ovl_upscale_frame((uint8 *)buf, w * 4, w, h, (const uint32_t *)g_frozen_frame,
+                           g_frozen_w * 4, g_frozen_w, g_frozen_h);
+  else
+    memset(buf, 0, (size_t)w * (size_t)h * 4);
+  RuntimeMenuCompose((uint8 *)buf, w * 4, w, h);
+  char path[1024];
+  snprintf(path, sizeof(path), "%s_%s.ppm", base, suffix);
+  WritePpm(path, (const uint8 *)buf, w * 4, w, h, g_present_frame, true);
+  free(buf);
+}
+static void RuntimeMenuSelftestTick(unsigned pump) {
+  if (g_menu_selftest_frame < 0) return;
+  switch (pump) {
+  case 3: RuntimeMenuSelftestDump("top"); break;
+  case 4: recomp_runtime_ui_handle_input(g_runtime_ui, RECOMP_RUNTIME_UI_INPUT_ACCEPT, 1, 0); break;
+  case 5: recomp_runtime_ui_handle_input(g_runtime_ui, RECOMP_RUNTIME_UI_INPUT_DOWN, 1, 0); break;
+  case 7: RuntimeMenuSelftestDump("section"); break;
+  case 8: recomp_runtime_ui_handle_input(g_runtime_ui, RECOMP_RUNTIME_UI_INPUT_BACK, 1, 0); break;
+  case 9:
+    recomp_runtime_ui_handle_input(g_runtime_ui, RECOMP_RUNTIME_UI_INPUT_TOGGLE, 1, 0);
+    fprintf(stderr, "[menu_selftest] closed with Start, open=%d\n",
+            recomp_runtime_ui_is_open(g_runtime_ui));
+    g_menu_selftest_frame = -1;
+    break;
+  default: break;
+  }
+}
+
+/* The menu's modal pump: the guest is frozen and the audio paused until the
+ * menu closes, like the save-state browser's. */
+static void RunRuntimeMenuLoop(bool *running) {
+  uint32 prev_pad = OverlayNavInputs();   /* the gesture's buttons are held */
+  uint32 held_since = 0, last_repeat = 0;
+  unsigned frames = 0;
+  host_report_breadcrumb("in-game menu OPEN - guest frozen until it closes "
+                         "(Escape or pad B/Start)");
+  g_runtime_ui_running = running;
+  g_overlay_modal = true;
+  SetAudioPaused(true);
+  recomp_runtime_ui_open(g_runtime_ui);
+  while (recomp_runtime_ui_is_open(g_runtime_ui) && *running) {
+    PumpOverlayEvents(running, &RuntimeMenuKeyDown);
+    if (!*running) break;
+    RuntimeMenuPollPad(&prev_pad, &held_since, &last_repeat);
+    RuntimeMenuSelftestTick(frames);
+    PresentFrozenWithOverlay();
+    SDL_Delay(8);
+    frames++;
+  }
+  recomp_runtime_ui_close(g_runtime_ui);
+  g_runtime_ui_running = NULL;
+  g_overlay_modal = false;
+  ResetAudioTimeline();
+  SetAudioPaused(g_paused);
+  OverlayNoteClosed();
+  host_report_breadcrumb("in-game menu CLOSED after %u pumps - guest resuming", frames);
+}
+#else
+static void RuntimeMenuCompose(uint8 *pixels, int pitch, int w, int h) {
+  (void)pixels; (void)pitch; (void)w; (void)h;
+}
+#endif /* RECOMP_LAUNCHER */
+
 /* The in-game launcher (SnesDesktopHostGame.in_game_launcher). The guest is
  * FROZEN throughout, exactly like the save-state browser: no RtlRunFrame, no
  * draw_ppu_frame. The game window is hidden rather than covered, so a
@@ -3360,7 +3821,20 @@ int snesrecomp_desktop_main(const SnesDesktopHostGame *game, int argc, char **ar
        * copy in an unwritable directory still finds a config. */
       SwitchDirectory();
     }
+    DebugLogInit();
     EnsureConfigIniNextToExe(program_path);
+    /* Keep the AOT coverage artifacts inside the game folder: the tree has
+     * to stay self-contained, and the capture journal is developer tooling
+     * rather than user state. */
+    {
+      char cwdbuf[1024];
+      if (getcwd(cwdbuf, sizeof(cwdbuf))) {
+        char cov_path[1200];
+        snprintf(cov_path, sizeof(cov_path), "%s/coverage", cwdbuf);
+        _putenv_s("SNESRECOMP_COVERAGE_DIR", cov_path);
+      }
+    }
+
     {
       char cwdbuf[1024];
       host_report_breadcrumb("config dir anchored: %s (exe-dir anchor: %s)",
@@ -3452,6 +3926,13 @@ int snesrecomp_desktop_main(const SnesDesktopHostGame *game, int argc, char **ar
   if (game->in_game_launcher)
     PadGestureConfigure(&g_launcher_gesture, g_config.launcher_gesture,
                         "Select+L3", "launcher", "LauncherGesture");
+#if defined(RECOMP_LAUNCHER)
+  if (game->in_game_menu) {
+    PadGestureConfigure(&g_menu_gesture, g_config.menu_gesture,
+                        "Select+Start", "menu", "MenuGesture");
+    RuntimeMenuCreate(game);
+  }
+#endif
   tier2_capture_configure(args.expose_coverage_mod || g_config.expose_coverage_mod,
                           g_config.coverage_capture, args.coverage_capture);
 
@@ -3466,9 +3947,11 @@ int snesrecomp_desktop_main(const SnesDesktopHostGame *game, int argc, char **ar
     char mods_dir[1024];
     if (config_file) snprintf(mods_dir, sizeof(mods_dir), SNES_MOD_CATALOG_ROOT);
     if (config_file || snesrecomp_exe_dir_path(SNES_MOD_CATALOG_ROOT, mods_dir, sizeof(mods_dir))) {
-      g_mods_ready = snes_mod_runtime_initialize_c(
+      g_mods_ready = snes_mod_runtime_initialize_multi_c(
           mods_dir, game->game_id,
-          game->expected_sha256_hex ? game->expected_sha256_hex : "");
+          game->expected_sha256_hex ? game->expected_sha256_hex : "",
+          game->known_sha256_hex,
+          game->num_known_sha256 > 0 ? game->num_known_sha256 : 0);
       if (!g_mods_ready)
         fprintf(stderr, "mods: unavailable: %s\n", snes_mod_runtime_last_error_c());
       else
@@ -3484,6 +3967,7 @@ int snesrecomp_desktop_main(const SnesDesktopHostGame *game, int argc, char **ar
   static char rom_path_buf[1024];
   {
     g_rom_identity_ok = DecodeRomIdentity(g_rom_sha256, &g_rom_crc32);
+    g_rom_num_sha256s = CollectRomSha256s();
     int rom_resolved_by_launcher = 0;
     char beside_exe[1024] = "";
     /* The ROM comes from the shared parser now: positional or --rom,
@@ -3655,9 +4139,18 @@ int snesrecomp_desktop_main(const SnesDesktopHostGame *game, int argc, char **ar
   /* Resolve the enabled features against THIS ROM and persist the plan. A
    * rejected plan (wrong ROM for a package, a plugin nothing registered) is a
    * refusal, not a silent fallback. */
-  if (g_mods_ready && !snes_mod_runtime_commit_c(rom_path_buf)) {
-    fprintf(stderr, "mods: plan rejected: %s\n", snes_mod_runtime_last_error_c());
-    return 1;
+  /* SNESRECOMP_SKIP_MOD_PLAN=1 runs a ROM the mod catalog does not target.
+   * The catalog is bound to one ROM by digest, so a comparison run against a
+   * different dump (a second regional release, say) would otherwise be refused
+   * before the first frame. The mods stay inactive; the tier2 capture is a
+   * separate mechanism and is unaffected. */
+  {
+    const char *skip_mods = getenv("SNESRECOMP_SKIP_MOD_PLAN");
+    const bool skip_plan = skip_mods && *skip_mods && strcmp(skip_mods, "0") != 0;
+    if (g_mods_ready && !skip_plan && !snes_mod_runtime_commit_c(rom_path_buf)) {
+      fprintf(stderr, "mods: plan rejected: %s\n", snes_mod_runtime_last_error_c());
+      return 1;
+    }
   }
 #endif
 
@@ -3768,6 +4261,31 @@ int snesrecomp_desktop_main(const SnesDesktopHostGame *game, int argc, char **ar
   }
   host_report_breadcrumb("rom loaded: %u bytes", kRom_SIZE);
   if (game->on_rom_loaded) game->on_rom_loaded(kRom, kRom_SIZE);
+  if (game->patch_rom_ex && kRom) {
+    /* A pack that changes the image's size (a language pack: the base ROM
+     * becomes the image the code was generated from, and that one is larger).
+     * The hook owns the buffer it hands back; the one read here is ours. */
+    char patch_error[256] = {0};
+    uint8 *patched = kRom;
+    size_t patched_size = kRom_SIZE;
+    if (!game->patch_rom_ex(&patched, &patched_size, patch_error, sizeof(patch_error))) {
+      Die(patch_error[0] ? patch_error : "a ROM patch failed to apply");
+      return 1;
+    }
+    if (patched != kRom) {
+      free(kRom);
+      kRom = patched;
+      kRom_SIZE = (uint32)patched_size;
+      host_report_breadcrumb("rom patched: %u bytes", kRom_SIZE);
+    }
+  }
+  if (game->patch_rom && kRom) {
+    char patch_error[256] = {0};
+    if (!game->patch_rom(kRom, kRom_SIZE, patch_error, sizeof(patch_error))) {
+      Die(patch_error[0] ? patch_error : "a ROM patch failed to apply");
+      return 1;
+    }
+  }
 
   RtlRegisterGame(game->game_info);
   msu1_set_rom_path(rom_path_buf);
@@ -4076,6 +4594,14 @@ error_reading:;
         }
         if (g_netplay_session && SNESRECOMP_SDL_EVENT_KEY(event) == SDLK_ESCAPE) {
           g_netplay_exit_requested = 1;
+          break;
+        }
+#endif
+#if defined(RECOMP_LAUNCHER)
+        /* Escape opens the in-game menu; it is not a SNES control. */
+        if (g_runtime_ui && SNESRECOMP_SDL_EVENT_KEY(event) == SDLK_ESCAPE &&
+            !SNESRECOMP_SDL_EVENT_REPEAT(event)) {
+          g_runtime_menu_hotkey = 1;
           break;
         }
 #endif
@@ -4390,6 +4916,32 @@ error_reading:;
         g_open_launcher_hotkey = 1;
       }
     }
+#if defined(RECOMP_LAUNCHER)
+    if (g_menu_selftest_frame == -2) {
+      const char *v = HostGetenv("MENU_SELFTEST");
+      g_menu_selftest_frame = v ? strtol(v, NULL, 0) : -1;
+    }
+    if (g_runtime_ui && g_menu_selftest_frame >= 0 &&
+        (long)frameCtr >= g_menu_selftest_frame && !g_runtime_menu_hotkey) {
+      fprintf(stderr, "[menu_selftest] opening the menu at frame %ld\n", (long)frameCtr);
+      g_runtime_menu_hotkey = 1;
+    }
+    if (g_runtime_ui &&
+        (g_runtime_menu_hotkey || PadGesturePressed(&g_menu_gesture)) &&
+        !snes_rewind_is_open() && !snes_savestate_menu_is_open() &&
+        !snes_netplay_active()) {
+      g_runtime_menu_hotkey = 0;
+      RunRuntimeMenuLoop(&running);
+      if (!running) {
+        exit_reason = "in-game menu: quit";
+        break;
+      }
+      /* "Return to launcher" leaves g_open_launcher_hotkey set: the launcher
+       * check below opens it now, from a closed menu. */
+      if (!g_open_launcher_hotkey) continue;
+    }
+    g_runtime_menu_hotkey = 0;
+#endif
     if (game->in_game_launcher &&
         (g_open_launcher_hotkey || PadGesturePressed(&g_launcher_gesture)) &&
         !snes_rewind_is_open() && !snes_savestate_menu_is_open()) {
@@ -4458,6 +5010,7 @@ error_reading:;
     ProfileEnd(kProfileGuest, profile_start);
     frameCtr++;
     g_present_frame = frameCtr;
+    DebugLogFrame((MonotonicSeconds() - guest_start) * 1000.0);
     if (game->after_run_frame) {
       profile_start = ProfileStart();
       double now = MonotonicSeconds();
@@ -4483,7 +5036,21 @@ error_reading:;
       host_report_breadcrumb("first frame simulated");
     else if (frameCtr % 3600 == 0)   /* ~once a minute at 60 fps */
       host_report_breadcrumb("heartbeat: frame=%u", frameCtr);
-    g_snes->disableRender = g_turbo && (frameCtr & 0xf) != 0;
+    /* Fast-forward presents on a wall-clock cadence (60 Hz), not every 16th
+     * frame: at ~2.6x that showed about ten pictures a second, a visible
+     * stutter, and every one of the 15 skipped frames was still rasterised
+     * in full -- more time than the guest itself. Skipped frames now run their
+     * lines without drawing pixels. */
+    {
+      static double s_turbo_presented_at;
+      bool present = true;
+      if (g_turbo) {
+        const double now = MonotonicSeconds();
+        present = now - s_turbo_presented_at >= 1.0 / 60.0;
+        if (present) s_turbo_presented_at = now;
+      }
+      g_snes->disableRender = g_turbo && !present;
+    }
     snes_osd_set_turbo(g_turbo);
 
     profile_start = ProfileStart();
@@ -4491,8 +5058,10 @@ error_reading:;
      * rewound. Doing it again here would redraw from the rewound state and
      * throw the speculation away -- which is precisely what made the feature
      * inert. */
+    g_ppu_skip_pixels = g_snes->disableRender;
     if (!runahead_captured)
       CaptureSimulationFrame(frameCtr);
+    g_ppu_skip_pixels = false;
     NoteStateFrame();
     g_audio_producer_active = false;
     ProfileEnd(kProfileRaster, profile_start);
@@ -5204,3 +5773,4 @@ static void EnsureConfigIniNextToExe(const char *exe_path) {
   /* Anchor declined (read-only install): fall back to the exe-relative write. */
   WriteDefaultConfigIni(exe_path);
 }
+/* end of host_main.c ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------*/

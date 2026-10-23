@@ -15,6 +15,10 @@
 
 extern Ppu *g_ppu;
 static DmaVramNotifyHook g_vram_notify_hook;
+/* Cumulative $420B (general-purpose DMA) starts. The debug HUD snapshots a
+ * delta per presented frame; HDMA per scanline is deliberately not counted
+ * because one frame would otherwise report hundreds of transfers. */
+uint32_t g_dma_transfer_count;
 
 /* Debug logging gate: set SNESRECOMP_DMA_DEBUG=1 to enable the DMA config /
  * CGRAM / S-DD1 arm trace. Off by default — the trace fires for every DMA
@@ -400,7 +404,19 @@ void dma_primeHdmaFirstLine(Dma* dma) {
   }
 }
 
+/* Master clocks the CPU was halted for by the last dma_doHdma() call: 18 when
+ * any channel is live, 8 per live channel, 8 per byte moved, 8 per table byte
+ * read on a descriptor reload (+16 for an indirect address). Measured, not
+ * estimated: a non-repeat entry moves its bytes on its first line only. */
+static uint32_t s_hdma_line_cost;
+
+uint32_t dma_hdmaLastLineCost(void) {
+  return s_hdma_line_cost;
+}
+
 void dma_doHdma(Dma* dma) {
+  uint32_t cost = 0;
+  s_hdma_line_cost = 0;
   for (int i = 0; i < 8; i++) {
     DmaChannel* ch = &dma->channel[i];
     if (!ch->hdmaActive) continue;
@@ -413,12 +429,15 @@ void dma_doHdma(Dma* dma) {
       ch->tableAdr = ch->aAdr;
       dma_hdmaLoadDescriptor(dma, ch);
       ch->offIndex = 0;
+      cost += ch->indirect ? 32u : 16u;
       continue;
     }
     if (ch->terminated) continue;
+    cost += 8u;
 
     if (ch->doTransfer) {
       int len = transferLength[ch->mode & 7];
+      cost += 8u * (uint32_t)len;
       for (int j = 0; j < len; j++) {
         uint8_t bAdr = (uint8_t)(ch->bAdr + bAdrOffsets[ch->mode & 7][j]);
         g_ppu_wlog_src = kPpuWlogHdma;
@@ -432,9 +451,13 @@ void dma_doHdma(Dma* dma) {
 
     ch->repCount--;
     ch->doTransfer = (ch->repCount & 0x80) != 0;
-    if ((ch->repCount & 0x7f) == 0)
+    if ((ch->repCount & 0x7f) == 0) {
       dma_hdmaLoadDescriptor(dma, ch);
+      cost += ch->indirect ? 24u : 8u;
+    }
   }
+  if (cost)
+    s_hdma_line_cost = 18u + cost;
 }
 
 /* ── HDMA ────────────────────────────────────────────────────────────────
@@ -510,6 +533,7 @@ bool dma_source_is_offmap(int cart_type, bool from_b, uint8_t a_bank,
 }
 
 void dma_startDma(Dma* dma, uint8_t val, bool hdma) {
+  if (!hdma) g_dma_transfer_count++;
   /* Checked HERE, when the channel is armed, and not once per transferred
    * byte as it used to be.
    *

@@ -264,6 +264,9 @@ struct Runtime {
     fs::path root;
     std::string game_id;
     std::string rom_sha256;
+    /* The other dumps this title accepts (a base ROM a language pack turns
+     * into the image the code was generated from). */
+    std::vector<std::string> accepted_rom_sha256;
     std::map<std::string, std::map<std::string, Package>> packages;
     std::map<std::string, PackageSelection> selections;
     std::map<std::string, PackageSelection> offline_selections;
@@ -1512,6 +1515,12 @@ bool scan(Runtime& runtime, std::string* error) {
     diagnostic.author = "snesrecomp";
     diagnostic.description = "Local diagnostics shared by every SNES game.";
     diagnostic.targets.push_back({runtime.game_id, runtime.rom_sha256});
+    /* The engine-owned capture works with any dump this title accepts (a
+     * base ROM a language pack turns into the image the code was made
+     * from), so it names them all. */
+    for (const std::string& other : runtime.accepted_rom_sha256) {
+        diagnostic.targets.push_back({runtime.game_id, other});
+    }
     Feature capture;
     capture.id = "capture";
     capture.name = "Coverage Capture";
@@ -3019,12 +3028,14 @@ void publish_variants(Runtime& runtime) {
 bool mod_runtime_initialize(const fs::path& root,
                             const std::string& game_id,
                             const std::string& rom_sha256,
+                            const std::vector<std::string>& accepted_rom_sha256,
                             std::string* error) {
     Runtime& runtime = state();
     runtime = {};
     runtime.root = root;
     runtime.game_id = game_id;
     runtime.rom_sha256 = rom_sha256;
+    runtime.accepted_rom_sha256 = accepted_rom_sha256;
     if (game_id.empty() || !valid_sha256(rom_sha256)) {
         set_error(error, "invalid SNES mod target identity");
         return false;
@@ -3051,15 +3062,36 @@ bool mod_runtime_commit(const fs::path& rom_path, std::string* error) {
             return false;
         }
         if (digest != runtime.rom_sha256) {
-            runtime.error =
-                "The selected ROM does not match this mod catalog target.";
-            set_error(error, runtime.error);
-            return false;
+            /* The title accepts other dumps too (a base ROM a language pack
+             * turns into the image the code was generated from). Follow the
+             * file the player picked: the packages whose targets name that
+             * dump are the ones this session offers. */
+            bool accepted = false;
+            for (const std::string& other : runtime.accepted_rom_sha256) {
+                if (other == digest) {
+                    accepted = true;
+                    break;
+                }
+            }
+            if (!accepted) {
+                runtime.error =
+                    "The selected ROM does not match this mod catalog target.";
+                set_error(error, runtime.error);
+                return false;
+            }
+            runtime.rom_sha256 = digest;
         }
     }
     runtime.validation = validate(runtime);
     if (!runtime.validation.ok) {
         runtime.error = "Resolve the highlighted mod conflicts before Play.";
+        /* The launcher shows the details; a headless run has no launcher, so
+         * say what is wrong here instead of only that something is. */
+        for (const auto& diagnostic : runtime.validation.diagnostics) {
+            fprintf(stderr, "mods: %s/%s: %s (%s)\n",
+                    diagnostic.package_id.c_str(), diagnostic.feature_id.c_str(),
+                    diagnostic.message.c_str(), diagnostic.resource.c_str());
+        }
         set_error(error, runtime.error);
         return false;
     }
@@ -3202,7 +3234,24 @@ extern "C" int snes_mod_runtime_initialize_c(
     return SNESRecomp::mod_runtime_initialize(
         root ? fs::path(root) : fs::path("mods"),
         game_id ? game_id : "",
-        rom_sha256 ? rom_sha256 : "", &error) ? 1 : 0;
+        rom_sha256 ? rom_sha256 : "", {}, &error) ? 1 : 0;
+    SNES_MOD_C_END(0)
+}
+
+extern "C" int snes_mod_runtime_initialize_multi_c(
+    const char* root, const char* game_id, const char* rom_sha256,
+    const char* const* accepted_rom_sha256, int num_accepted) {
+    SNES_MOD_C_BEGIN
+    std::vector<std::string> accepted;
+    for (int i = 0; i < num_accepted; ++i) {
+        if (accepted_rom_sha256 && accepted_rom_sha256[i] && accepted_rom_sha256[i][0])
+            accepted.push_back(accepted_rom_sha256[i]);
+    }
+    std::string error;
+    return SNESRecomp::mod_runtime_initialize(
+        root ? fs::path(root) : fs::path("mods"),
+        game_id ? game_id : "",
+        rom_sha256 ? rom_sha256 : "", accepted, &error) ? 1 : 0;
     SNES_MOD_C_END(0)
 }
 
