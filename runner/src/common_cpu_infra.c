@@ -932,6 +932,14 @@ void snes_refresh_state_set(uint64_t phase, uint64_t charged_upto) {
 // Called at loop headers in generated code — detect infinite loops
 void WatchdogCheck(void) {
   snes_refresh_charge();
+  /* Keep the SPC700 moving while AOT code runs. The interpreter bridge and
+   * the audio thread already advance the APU every ~1024 master cycles;
+   * compiled blocks do not, so a guest routine that polls $2140-$2143 (the
+   * SPC upload/ack handshakes) spins forever with a frozen APU. That is
+   * exactly the C3:060A watchdog seen on Secret of Mana's NMI upload. This
+   * is the documented hook for it -- rtl_apu_pace_check() no-ops during
+   * boot (frame 0) and rate-limits itself to one sync per 1024 cycles. */
+  rtl_apu_pace_check();
 #ifdef SNES_COSIM
   /* Co-sim WRAM watchpoint (dev, env-gated): name the recompiled function that
    * writes a given low-WRAM address. WatchdogCheck runs per-block with

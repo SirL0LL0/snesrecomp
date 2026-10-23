@@ -181,6 +181,24 @@ int interp_bridge_run_until_quiescent(CpuState *cpu, uint32_t entry_pc24);
 uint32_t interp_bridge_lle_resume_pc(void);
 /* Host override of the resume PC (recorded in the resume ring as external). */
 void interp_bridge_set_lle_resume_pc(uint32_t pc);
+/* Forget any resume PC left by the run that was interrupted. An interrupt
+ * handler that completes with RTI leaves its return PC in CpuState; a handler
+ * that yields mid-way sets a fresh resume PC. Clearing first lets the host
+ * tell those apart instead of resuming at the interrupted task's stale PC. */
+void interp_bridge_clear_lle_resume_pc(void);
+
+/* PC/PB popped by the RTI that ended the most recent interrupt run, or 0 if
+ * the run yielded (deadline/IRQ/WAI) before reaching RTI. SoM's IRQ handler
+ * task-switches by replacing its return frame, so the host must resume at this
+ * PC (and the S left in CpuState) rather than the interrupted task's PC. */
+uint32_t interp_bridge_last_interrupt_return_pc(void);
+
+/* Guest PC at the most recent interpreter-to-CpuState sync. This is the real
+ * exit point of a host interrupt run: an RTI compiled into an AOT body still
+ * leaves the interpreter at the post-RTI PC, and a step-cap bail leaves it at
+ * the instruction it stopped on. Clear before a handler to tell fresh exits
+ * from the interrupted run's leftovers. */
+uint32_t interp_bridge_last_exit_pc(void);
 
 /*
  * Rollback support: the bridge carries execution state across frames that no

@@ -92,6 +92,12 @@ class BankCfg:
     exclude_ranges: List[Tuple[int, int]] = field(default_factory=list)
     authority_insns: dict[int, bytes] = field(default_factory=dict)
     authority_data: List[Tuple[int, int]] = field(default_factory=list)
+    # rom_operand <pc16>: an immediate load (LDA/LDX/LDY #imm) whose operand
+    # a ROM patch the executable must also run (a translation's relocated
+    # text pointers) changes. Lowered as a read of the operand bytes from the
+    # loaded image instead of a constant, so one generated program serves
+    # both images. The instruction stays recompiled.
+    rom_operands: set = field(default_factory=set)
     data_regions: List[Tuple[int, int, int]] = field(default_factory=list)  # (bank, start, end)
     # exit_mx_at directives: list of (bank, addr16, m, x) — annotates the
     # exit (m, x) state of a function at that PC. Decoder uses this to
@@ -318,6 +324,14 @@ def load_bank_cfg(path: str) -> BankCfg:
                 if not 0 <= start < end <= 0x10000:
                     raise ValueError(f"{path}: invalid authority_data interval")
                 cfg.authority_data.append((start, end))
+                continue
+            if head == 'rom_operand':
+                if len(tokens) != 2:
+                    raise ValueError(f"{path}: rom_operand needs <pc16>")
+                pc16 = _parse_hex(tokens[1])
+                if not 0 <= pc16 <= 0xFFFF:
+                    raise ValueError(f"{path}: invalid rom_operand pc")
+                cfg.rom_operands.add(pc16)
                 continue
             if head == 'authority_insn':
                 if len(tokens) != 3:

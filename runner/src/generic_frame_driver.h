@@ -43,6 +43,9 @@ void snes_generic_frame_driver_run_frame(void);
 void snes_generic_frame_driver_draw_ppu_frame(void);
 void snes_generic_frame_driver_reset(void);
 
+/* Call after a state load so the driver resumes at the restored PC. */
+void snes_generic_frame_driver_state_loaded(void);
+
 /* An RtlGameInfo wired to the functions above. `title` is used for save-slot
  * naming only; pass the variant id. The returned pointer stays valid for the
  * process; the struct is reconfigured in place on each call. */

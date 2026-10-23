@@ -138,11 +138,26 @@ def lower(insn: Insn, *, value_factory: ValueFactory) -> List[IROp]:
 
 # ── Per-mnemonic handlers ───────────────────────────────────────────────────
 
+# 24-bit PCs of immediate loads declared `rom_operand` in the bank cfgs (set by
+# program_emit before any function is lowered). Their operand is read from the
+# loaded ROM image at run time instead of being folded into a constant.
+ROM_OPERAND_PCS: set = set()
+
+
+def _imm_load(insn, w, v) -> IROp:
+    pc = insn.addr & 0xFFFFFF
+    if pc in ROM_OPERAND_PCS:
+        return Read(seg=SegRef(kind=SegKind.LONG, offset=(pc + 1) & 0xFFFF,
+                               bank=(pc >> 16) & 0xFF),
+                    width=w, out=v)
+    return ConstI(value=insn.operand, width=w, out=v)
+
+
 def _h_lda(insn, vf):
     w = _width_a(insn)
     if insn.mode == IMM:
         v = vf()
-        return [ConstI(value=insn.operand, width=w, out=v),
+        return [_imm_load(insn, w, v),
                 WriteReg(reg=Reg.A, src=v),
                 SetNZ(src=v, width=w)]
     seg = _segref_for(insn)
@@ -156,7 +171,7 @@ def _h_ldx(insn, vf):
     w = _width_x(insn)
     if insn.mode == IMM:
         v = vf()
-        return [ConstI(value=insn.operand, width=w, out=v),
+        return [_imm_load(insn, w, v),
                 WriteReg(reg=Reg.X, src=v),
                 SetNZ(src=v, width=w)]
     seg = _segref_for(insn)
@@ -170,7 +185,7 @@ def _h_ldy(insn, vf):
     w = _width_x(insn)
     if insn.mode == IMM:
         v = vf()
-        return [ConstI(value=insn.operand, width=w, out=v),
+        return [_imm_load(insn, w, v),
                 WriteReg(reg=Reg.Y, src=v),
                 SetNZ(src=v, width=w)]
     seg = _segref_for(insn)

@@ -769,6 +769,12 @@ def emit_program(*, rom: bytes, parsed, manifest: ProgramManifest,
                  rom_sha256_hex: str | None = None,
                  rom_size: int | None = None) -> EmissionResult:
     validate_module_identity(module_id, module_prefix)
+    # `rom_operand` immediates: lowered as reads of the loaded image.
+    from .lowering import ROM_OPERAND_PCS
+    ROM_OPERAND_PCS.clear()
+    for _bank, _path, _cfg in parsed:
+        for _pc16 in getattr(_cfg, 'rom_operands', ()):
+            ROM_OPERAND_PCS.add(((_bank & 0xFF) << 16) | _pc16)
     # Identity of the IMAGE the module was generated from. The caller passes
     # both when its `rom` already carries materialized ram_routine blobs (the
     # runtime verifies the player's file, which never does).

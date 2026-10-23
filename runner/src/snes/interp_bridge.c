@@ -22,6 +22,10 @@
                                 * tail-armed context on the LLE yield unwind */
 #include "ppu_dma_trace.h"      /* ppudma_note_interrupt — per-frame tally */
 
+/* Owned by common_cpu_infra.c; only the opt-in WRAM entry diagnostic reads
+ * the AOT call stack, and common_cpu_infra.h does not expose the array. */
+extern const char *g_recomp_stack[];
+
 /* Guest-time-anchored APU (Rockman X JP gate #3 / audio pacing): the interp
  * tier advances the SPC per interpreted opcode by guest master cycles, exactly
  * like the faithful reference (cosim/ref_driver.c). Cold-boot handshakes that
@@ -407,7 +411,9 @@ static void sync_cpu_to_interp(const CpuState *c, Interp816 *in) {
     in->n  = c->_flag_N; in->i = c->_flag_I; in->d = c->_flag_D;
     in->mf = c->m_flag;  in->xf = c->x_flag; in->e = c->emulation;
 }
+static uint32_t s_interp_exit_pc24;
 static void sync_interp_to_cpu(const Interp816 *in, CpuState *c) {
+    s_interp_exit_pc24 = ((uint32_t)in->k << 16) | in->pc;
     c->A = in->a;  c->X = in->x;  c->Y = in->y;
     c->S = in->sp; c->D = in->dp; c->DB = in->db; c->PB = in->k;
     c->_flag_C = in->c; c->_flag_Z = in->z; c->_flag_V = in->v;
@@ -521,6 +527,8 @@ static int      s_lle_unwind_owner_depth = 0;
 static int      s_lle_unwind_is_deadline = 0;
 static int      s_lle_next_unwind_is_deadline = 0;
 static uint32_t s_lle_resume_pc24   = 0;
+/* PC popped by the RTI that ended the last host interrupt run (0 = no RTI). */
+static uint32_t s_interp_int_return_pc24 = 0;
 static int      s_interp_pctrace    = 0;
 static int      s_lle_wai_yield     = 0;
 static int      s_lle_quiescent_yield = 0;
@@ -537,6 +545,11 @@ unsigned long long g_interp_bridge_bounces = 0;
 /* Opcodes the bridge INTERPRETED. Together with the bounce count this says
  * how much of a run the AOT tier is actually carrying. */
 unsigned long long g_interp_bridge_steps = 0;
+/* Master clocks charged by interpreted opcodes. The desktop host subtracts
+ * this from the guest's total master-clock delta to show the recompiled vs
+ * interpreted split as a percentage of emulated CPU time. The counter is
+ * cumulative and never reset with guest state, so a host snapshots deltas. */
+unsigned long long g_interp_bridge_master_cycles = 0;
 
 /* Optional host coverage hooks. Both are NULL by default and cost one
  * predictable branch when unset.
@@ -799,6 +812,13 @@ static int bridge_cooperative_yield(CpuState *cpu, const Interp816 *in,
     return 1;
 }
 uint32 interp_bridge_lle_resume_pc(void) { return s_lle_resume_pc24; }
+void interp_bridge_clear_lle_resume_pc(void) { s_lle_resume_pc24 = 0; }
+uint32_t interp_bridge_last_interrupt_return_pc(void) {
+    return s_interp_int_return_pc24;
+}
+uint32_t interp_bridge_last_exit_pc(void) {
+    return s_interp_exit_pc24;
+}
 void interp_bridge_set_lle_resume_pc(uint32_t pc) {
     lle_resume_set(pc, INTERP_RESUME_SITE_EXTERNAL, 0);
 }
@@ -1541,6 +1561,40 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
     uint32_t edge_from = 0, edge_expect = entry_pc24 & 0xFFFFFFu;
     uint8_t edge_op = 0;
     interp_edge_note(0, entry_pc24, INTERP_EDGE_ENTRY, 0, (uint16_t)cpu->S);
+    /* SNESRECOMP_WRAM_DIAG=1: report interpreter entries into WRAM. A bad
+     * return address (the SoM intro's Start path historically landed at
+     * $7E9D37 and executed BRK) is otherwise invisible until the BRK vector
+     * loops; the stack bytes name the frame that produced it. */
+    {
+        static int s_wram_diag = -1;
+        if (s_wram_diag < 0)
+            s_wram_diag = getenv("SNESRECOMP_WRAM_DIAG") ? 1 : 0;
+        if (s_wram_diag && ((entry_pc24 >> 16) & 0xFF) == 0x7E) {
+            static int s_wram_reports;
+            if (s_wram_reports < 24) {
+                s_wram_reports++;
+                fprintf(stderr,
+                        "[wram_diag] f=%d entry=$%06X S=$%04X A=$%04X "
+                        "X=$%04X Y=$%04X D=$%04X DB=$%02X P=$%02X E=%u "
+                        "stop_rti=%d depth=%d top=%s\n",
+                        snes_frame_counter, (unsigned)entry_pc24,
+                        (unsigned)cpu->S, (unsigned)cpu->A, (unsigned)cpu->X,
+                        (unsigned)cpu->Y, (unsigned)cpu->D,
+                        (unsigned)cpu->DB, (unsigned)cpu->P,
+                        (unsigned)(cpu->emulation & 1), stop_on_rti,
+                        s_interp_bridge_depth,
+                        (g_recomp_stack_top > 0 && g_recomp_stack[g_recomp_stack_top - 1])
+                            ? g_recomp_stack[g_recomp_stack_top - 1] : "(none)");
+                for (int _i = 1; _i <= 20; _i++) {
+                    uint16_t _sa = (uint16_t)(cpu->S + _i);
+                    fprintf(stderr, "  [S+%02d]=$%02X%s",
+                            _i, (unsigned)cpu_read8(cpu, 0, _sa),
+                            (_i % 8) == 0 ? "\n" : "");
+                }
+                fputc('\n', stderr);
+            }
+        }
+    }
 
     typedef struct QuiescentState {
         uint32_t pc;
@@ -2441,6 +2495,25 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
         if (g_interp_bridge_pc_hook)
             g_interp_bridge_pc_hook(pc_before & 0xFFFFFFu,
                                     in.mf ? 1 : 0, in.xf ? 1 : 0);
+        /* A host interrupt run normally ends at RTI. SoM's WRAM scheduler is
+         * different: its IRQ handler switches the active task by tail-jumping
+         * out of bank $7E into the ROM main loop (observed at Start:
+         * $7EAF24 JML $C00009). If we keep running it under stop_on_rti, the
+         * main loop's $4212 vblank poll spins to the step cap with the PPU
+         * beam frozen, leaving the game half-initialized (stripe screen).
+         * Return to the host at the jump so the normal frame run executes the
+         * new task with the beam advancing. */
+        if (stop_on_rti && op == 0x5C && (pc_before >> 16) == 0x7E) {
+            const uint32_t tgt =
+                bridge_bus_read(cpu, pc_before + 1) |
+                (bridge_bus_read(cpu, pc_before + 2) << 8) |
+                (bridge_bus_read(cpu, pc_before + 3) << 16);
+            if ((tgt >> 16) != 0x7E) {
+                sync_interp_to_cpu(&in, cpu);
+                bridge_apu_flush(cpu);
+                return 1;
+            }
+        }
         int _cyc = interp816_runOpcode(&in);   /* executes the opcode; pushes/pops frames */
         if (s_interp_pctrace && steps < 4)
             fprintf(stderr, "[pctrace] step=%ld post-runOpcode cyc=%d pc=%02X:%04X\n",
@@ -2473,6 +2546,7 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
                                ? (unsigned)_cyc - s_interp_bus_cycles : 0;
             uint64_t _master = s_interp_bus_master + (uint64_t)_internal * 6u;
             g_interp_bridge_steps++;
+            g_interp_bridge_master_cycles += _master;
             cpu->cycles        += (uint64_t)_cyc;
             cpu->master_cycles += _master;
             /* DRAM refresh tax — shared watermark with the AOT tier's
@@ -2570,6 +2644,11 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
          * P/PC/PB here; host control flow deliberately discards guest PC/PB.
          * Do not continue interpreting at the placeholder return address. */
         if (stop_on_rti && op == 0x40) {
+            /* Record the architectural return PC before sync: SoM's IRQ
+             * handler task-switches by replacing its return frame, so the
+             * host must resume where the RTI points, not where the
+             * interrupted task stopped. */
+            s_interp_int_return_pc24 = ((uint32_t)in.k << 16) | in.pc;
             sync_interp_to_cpu(&in, cpu);
             bridge_apu_flush(cpu);
             return 1;
@@ -3115,8 +3194,28 @@ int interp_bridge_run_interrupt(CpuState *cpu, uint32_t entry_pc24) {
      * runs an architectural interrupt handler through, so counting here
      * cannot miss a delivery the way a per-host hook would. */
     ppudma_note_interrupt(g_snes && g_snes->inNmi);
-    return interp_bridge_run_ex2(cpu, entry_pc24, cpu->S, NULL, NULL,
-                                 0, 0, 0, 0, NULL, 0, 1);
+    s_interp_int_return_pc24 = 0;  /* set again only if this run RTIs */
+    s_interp_exit_pc24 = 0;        /* set by the first sync of this run */
+    int _r = interp_bridge_run_ex2(cpu, entry_pc24, cpu->S, NULL, NULL,
+                                   0, 0, 0, 0, NULL, 0, 1);
+    {
+        static int s_diag = -1;
+        extern int snes_frame_counter;
+        if (s_diag < 0) s_diag = getenv("SNESRECOMP_IRQ_DIAG") ? 1 : 0;
+        if (s_diag && snes_frame_counter >= 929 &&
+            snes_frame_counter <= 931) {
+            fprintf(stderr,
+                    "[intdiag] f=%d entry=%06X ret=%d rti=%06X resume=%06X "
+                    "S=%04X PB=%02X DB=%02X depth=%d\n",
+                    snes_frame_counter, (unsigned)entry_pc24, _r,
+                    (unsigned)s_interp_int_return_pc24,
+                    (unsigned)s_lle_resume_pc24, (unsigned)cpu->S,
+                    (unsigned)cpu->PB, (unsigned)cpu->DB,
+                    s_interp_bridge_depth);
+            interp_bridge_dump_resume_ring(24, stderr);
+        }
+    }
+    return _r;
 }
 
 /* ── tier-down entry (called from generated indirect-dispatch defaults) ───── */

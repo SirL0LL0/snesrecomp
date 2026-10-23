@@ -130,11 +130,27 @@ static void ppu_render_pixel(Ppu *ppu, int x, int y) {
     }
   }
   int row = y - 1;
-  uint8 *pixelBuffer = (uint8 *)&ppu->renderBuffer[row * ppu->renderPitch + (x + ppu->extraLeftRight) * 4];
-  pixelBuffer[0] = ((b << 3) | (b >> 2)) * PPU_brightness(ppu) / 15;
-  pixelBuffer[1] = ((g << 3) | (g >> 2)) * PPU_brightness(ppu) / 15;
-  pixelBuffer[2] = ((r << 3) | (r >> 2)) * PPU_brightness(ppu) / 15;
-  pixelBuffer[3] = 0;
+  uint8 *rowBuffer = &ppu->renderBuffer[row * ppu->renderPitch];
+  if (PPU_mode(ppu) == 5 || PPU_mode(ppu) == 6) {
+    /* Hi-res modes emit one subscreen dot followed by one main-screen dot for
+     * each logical SNES pixel. ppu_resolve_pixel() already samples those dots
+     * at x*2 and x*2+1 respectively. */
+    uint8 *pixelBuffer = rowBuffer + (x + ppu->extraLeftRight) * 8;
+    pixelBuffer[0] = ((b2 << 3) | (b2 >> 2)) * PPU_brightness(ppu) / 15;
+    pixelBuffer[1] = ((g2 << 3) | (g2 >> 2)) * PPU_brightness(ppu) / 15;
+    pixelBuffer[2] = ((r2 << 3) | (r2 >> 2)) * PPU_brightness(ppu) / 15;
+    pixelBuffer[3] = 0;
+    pixelBuffer[4] = ((b << 3) | (b >> 2)) * PPU_brightness(ppu) / 15;
+    pixelBuffer[5] = ((g << 3) | (g >> 2)) * PPU_brightness(ppu) / 15;
+    pixelBuffer[6] = ((r << 3) | (r >> 2)) * PPU_brightness(ppu) / 15;
+    pixelBuffer[7] = 0;
+  } else {
+    uint8 *pixelBuffer = rowBuffer + (x + ppu->extraLeftRight) * 4;
+    pixelBuffer[0] = ((b << 3) | (b >> 2)) * PPU_brightness(ppu) / 15;
+    pixelBuffer[1] = ((g << 3) | (g >> 2)) * PPU_brightness(ppu) / 15;
+    pixelBuffer[2] = ((r << 3) | (r >> 2)) * PPU_brightness(ppu) / 15;
+    pixelBuffer[3] = 0;
+  }
 }
 
 static int ppu_resolve_pixel(Ppu *ppu, int x, int y, bool sub,

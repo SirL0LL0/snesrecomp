@@ -2610,7 +2610,11 @@ void RtlReadSram(void) {
   if (f) {
     if (fread(g_sram, 1, g_sram_size, f) != g_sram_size)
       fprintf(stderr, "Error reading %s\n", path);
+    else
+      fprintf(stderr, "[sram] Successfully read %d bytes from %s\n", g_sram_size, path);
     fclose(f);
+  } else {
+    fprintf(stderr, "[sram] No save file at %s (starting fresh)\n", path);
   }
 }
 
@@ -2620,6 +2624,7 @@ int RtlTryWriteSram(void) {
   char path[128], bak[140], tmp[140];
   RtlEnsureSaveDir();
   RtlSramFilePath(path, sizeof(path));
+  fprintf(stderr, "[sram] Writing to: %s\n", path);
   snprintf(bak, sizeof(bak), "%s.bak", path);
   snprintf(tmp, sizeof(tmp), "%s.tmp", path);
   FILE *f = fopen(tmp, "wb");
@@ -2659,6 +2664,7 @@ int RtlTryWriteSram(void) {
     remove(tmp);
     return 0;
   }
+  fprintf(stderr, "[sram] Successfully wrote %d bytes to %s\n", g_sram_size, path);
   return 1;
 }
 
@@ -2750,6 +2756,10 @@ void SimpleHdma_DoLine(SimpleHdma *c) {
     }
     c->rep_count = *c->table++;
     if (c->rep_count == 0) {
+      /* $00 is the terminator: this channel stops for the rest of
+       * the field. It is NOT "256 lines" -- reading it that way
+       * kept a dead channel alive for another 128 scanlines and
+       * wrote whatever followed the terminator into the CGRAM. */
       c->table = NULL;
       return;
     }
@@ -2785,3 +2795,4 @@ void SimpleHdma_DoLine(SimpleHdma *c) {
   }
   c->rep_count--;
 }
+/* end of SimpleHdma_DoLine */                                

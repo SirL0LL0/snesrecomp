@@ -15,6 +15,10 @@
 
 extern Ppu *g_ppu;
 static DmaVramNotifyHook g_vram_notify_hook;
+/* Cumulative $420B (general-purpose DMA) starts. The debug HUD snapshots a
+ * delta per presented frame; HDMA per scanline is deliberately not counted
+ * because one frame would otherwise report hundreds of transfers. */
+uint32_t g_dma_transfer_count;
 
 /* Debug logging gate: set SNESRECOMP_DMA_DEBUG=1 to enable the DMA config /
  * CGRAM / S-DD1 arm trace. Off by default — the trace fires for every DMA
@@ -510,6 +514,7 @@ bool dma_source_is_offmap(int cart_type, bool from_b, uint8_t a_bank,
 }
 
 void dma_startDma(Dma* dma, uint8_t val, bool hdma) {
+  if (!hdma) g_dma_transfer_count++;
   /* Checked HERE, when the channel is armed, and not once per transferred
    * byte as it used to be.
    *

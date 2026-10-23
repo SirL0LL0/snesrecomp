@@ -94,6 +94,8 @@ void dma_primeHdmaFirstLine(Dma* dma);
 uint64_t dma_hdmaMasterEstimate(Dma* dma); /* per-frame CPU-stall estimate */
 bool dma_cycle(Dma* dma);
 void dma_startDma(Dma* dma, uint8_t val, bool hdma);
+/* Cumulative general-purpose DMA starts ($420B, not HDMA). Diagnostics only. */
+extern uint32_t g_dma_transfer_count;
 /* True when an A-bus DMA source cannot be cartridge data on this mapping --
  * a $80+ bank below $8000 on LoROM. Judged where the channel is ARMED, from
  * the address the game programmed: a legal transfer wraps within its bank and

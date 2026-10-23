@@ -187,6 +187,11 @@ struct SpcPlayer *g_spc_player;
  * runs guest code in the middle of it). Sized for the runner's maximum
  * side-space budget. */
 static uint8_t g_my_pixels[kPpuBufWidth * 4 * 240];
+/* Mode 5/6 rasterize two dots per logical SNES pixel. Keep that 512-dot
+ * field separate from the 256-pixel host frame so hires transitions do not
+ * resize the game window or change the frontend's logical resolution. */
+static uint8_t g_ppu_pixels[kPpuBufWidth * 4 * 240];
+static int g_ppu_render_width = 256;
 
 extern uint8_t g_ram[0x20000];
 
@@ -581,6 +586,11 @@ static void PreparePpuFrame(void) {
 
   int fw = g_game->frame_width > 0 ? g_game->frame_width : 256;
   int fh = g_game->frame_height > 0 ? g_game->frame_height : 224;
+  int render_fw = fw;
+  /* Modes 5/6 produce 512 PPU dots for the same 256-pixel SNES viewport. */
+  if (!g_game->native_widescreen && g_ppu &&
+      (((g_ppu->bgmode & 7) == 5) || ((g_ppu->bgmode & 7) == 6)))
+    render_fw = 512;
   if (g_game->prepare_frame)
     g_game->prepare_frame(drawable_width, drawable_height, &fw, &fh);
   int max_width = g_game->native_widescreen ? kPpuBufWidth : kSnesDesktopMaxFrameWidth;
@@ -588,6 +598,7 @@ static void PreparePpuFrame(void) {
   if (fh <= 0 || fh > 240) fh = 224;
   g_snes_width = fw;
   g_snes_height = fh;
+  g_ppu_render_width = render_fw;
   /* Native widescreen ports rasterize directly into the widened field. */
   g_ws_extra = g_game->native_widescreen ? (fw - 256) / 2 : 0;
   g_ws_active = g_ws_extra != 0;
@@ -606,9 +617,36 @@ static void PreparePpuFrame(void) {
    * PPU never saw, so those ports always ran the reference rasteriser. */
   uint32 flags = g_ppu_render_flags;
   if (g_ws_active) flags |= kPpuRenderFlags_NewRenderer;
-  PpuBeginDrawing(g_ppu, g_my_pixels,
-                  (g_game->native_widescreen ? fw : 256) * 4, flags);
+  PpuBeginDrawing(g_ppu, g_ppu_pixels, render_fw * 4, flags);
   PpuSetExtraSpace(g_ppu, (uint8)g_ws_extra);
+}
+
+/* Convert the completed PPU field to the stable host viewport. In hires
+ * modes each logical pixel is a subscreen/main-screen dot pair; averaging
+ * the pair preserves both channels while keeping the game's 256x224 window. */
+static void FinalizePpuFrame(void) {
+  const int out_w = g_snes_width;
+  const int in_w = g_ppu_render_width;
+  if (out_w <= 0 || in_w <= 0 || g_snes_height <= 0) return;
+  for (int y = 0; y < g_snes_height; y++) {
+    const uint8_t *src = g_ppu_pixels + (size_t)y * in_w * 4;
+    uint8_t *dst = g_my_pixels + (size_t)y * out_w * 4;
+    if (in_w == out_w) {
+      memcpy(dst, src, (size_t)out_w * 4);
+      continue;
+    }
+    for (int x = 0; x < out_w; x++) {
+      const int x0 = (int)((int64_t)x * in_w / out_w);
+      const int x1 = (int)((int64_t)(x + 1) * in_w / out_w);
+      const int samples = IntMax(x1 - x0, 1);
+      for (int c = 0; c < 3; c++) {
+        unsigned sum = 0;
+        for (int sx = x0; sx < x1; sx++) sum += src[sx * 4 + c];
+        dst[x * 4 + c] = (uint8_t)((sum + samples / 2) / samples);
+      }
+      dst[x * 4 + 3] = 0;
+    }
+  }
 }
 
 // --- Scripted input ---
@@ -931,7 +969,7 @@ static bool ScriptCondHolds(const ScriptEntry *e) {
 
 static void ScriptDump(const char *tag, unsigned frame) {
   const char *dir = getenv("SNESRECOMP_DUMP_DIR");
-  const int pitch = (g_game->native_widescreen ? g_snes_width : 256) * 4;
+  const int pitch = g_snes_width * 4;
   int rc = snes_state_dump(dir ? dir : "", tag, g_my_pixels, pitch, g_ws_extra,
                            g_snes_height, frame);
   fprintf(stderr, "script f=%u dump %s %s\n", frame, tag, rc ? "partial" : "ok");
@@ -1142,8 +1180,10 @@ static SDL_HitTestResult HitTestCallback(SDL_Window *win, const SDL_Point *pt, v
 static void CaptureSimulationFrame(unsigned number) {
   PreparePpuFrame();
   if (g_game->begin_sim_frame) g_game->begin_sim_frame(number);
-  if (g_rtl_game_info && g_rtl_game_info->draw_ppu_frame)
+  if (g_rtl_game_info && g_rtl_game_info->draw_ppu_frame) {
     g_rtl_game_info->draw_ppu_frame();
+    FinalizePpuFrame();
+  }
   if (g_game->end_sim_frame) g_game->end_sim_frame(g_my_pixels, number);
 }
 
@@ -1190,8 +1230,8 @@ static int ComposeStateThumbnail(uint32_t *dst, size_t cap, int *w, int *h) {
 static void NoteStateFrame(void) {
   if (g_ppu && g_ppu->renderBuffer) {
     int width = g_game->native_widescreen ? g_snes_width : 256;
-    snes_savestate_menu_note_frame((const uint32_t *)g_ppu->renderBuffer, width, g_snes_height);
-    snes_rewind_note_framebuffer((const uint32_t *)g_ppu->renderBuffer, width, g_snes_height);
+    snes_savestate_menu_note_frame((const uint32_t *)g_my_pixels, width, g_snes_height);
+    snes_rewind_note_framebuffer((const uint32_t *)g_my_pixels, width, g_snes_height);
   }
   snes_rewind_note_frame();
 }

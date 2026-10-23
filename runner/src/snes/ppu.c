@@ -838,7 +838,15 @@ void ppu_runLine(Ppu* ppu, int line) {
              sizeof(ppu->overlayBuffers[kPpuOverlaySource_Obj]));
     ppu->lineHasSprites = !PPU_forcedBlank(ppu) && ppu_evaluateSprites(ppu, line - 1);
 
-    if (ppu->renderFlags & kPpuRenderFlags_NewRenderer) {
+    /* The new renderer has native layer composition for modes 0-3 and 7.
+     * Modes 4-6 use the SNES high-resolution/offset-per-tile paths, which are
+     * currently implemented only by the legacy pixel renderer. Sending them
+     * through PpuDrawBackgrounds() falls through to Mode 7 and corrupts the
+     * image (notably Secret of Mana's post-Start transition into mode 5). */
+    const unsigned mode = PPU_mode(ppu);
+    const bool new_renderer_supports_mode = mode <= 3 || mode == 7;
+    if ((ppu->renderFlags & kPpuRenderFlags_NewRenderer) &&
+        new_renderer_supports_mode) {
       debug_server_on_ppu_line_drawn(line, 1, ppu->bgmode);
       PPU_T0; PpuDrawWholeLine(ppu, line); PPU_ACC(g_ppu_sec_line_ms);
 #ifdef SNESRECOMP_INTERP_PROFILE
@@ -3226,8 +3234,34 @@ void ppu_rasterBegin(Ppu *ppu) {
   raster_snapshot(&s_field[0], ppu);
 }
 
+/* Field-boundary ownership. A beam-model host (the beam walks the field
+ * itself) lets the beam close the field when it crosses V=225. A frame-model
+ * host runs the WHOLE CPU half first, so the field boundary falls in the
+ * middle of it: that splits the field in two and empties the half being
+ * recorded, and the render then replays a cleared field over a stale
+ * snapshot (measured: force-blank, a black screen). Such a host takes the
+ * boundary over and calls ppu_rasterHostFieldBoundary() itself, at the start
+ * and at the end of its frame. */
+static bool s_raster_host_boundary;
+
+void ppu_rasterSetHostFieldBoundary(bool host_driven) {
+  s_raster_host_boundary = host_driven;
+}
+
+void ppu_rasterHostFieldBoundary(void) {
+  Ppu *ppu = raster_machine_ppu();
+  if (!s_raster_armed || !ppu)
+    return;
+  s_raster_rendering = 0;
+  s_raster_cur ^= 1;
+  s_raster_have_completed = 1;
+  raster_snapshot(&s_field[s_raster_cur], ppu);
+}
+
 void ppu_rasterFieldBoundary(void) {
   Ppu *ppu = raster_machine_ppu();
+  if (s_raster_host_boundary)
+    return;
   if (!s_raster_armed || !ppu)
     return;
   s_raster_rendering = 0;
@@ -3272,13 +3306,14 @@ int ppu_rasterTakeHdmaen(uint8_t *out) {
  * loop -- i.e. before dma_initHdma and the first dma_doHdma -- never inside
  * line 1: HDMA writes the same registers per line, and a restore after line
  * 1's HDMA write would stomp it. */
-void ppu_rasterRenderBegin(Ppu *ppu) {
+static void raster_render_begin_field(Ppu *ppu, int which) {
   const PpuRasterField *f;
   if (!s_raster_armed) return;
   /* Before any field has completed (the first frame), the recording one is
    * all there is. */
-  f = s_raster_have_completed ? &s_field[s_raster_cur ^ 1]
-                              : &s_field[s_raster_cur];
+  f = (which >= 0) ? &s_field[which & 1]
+                   : (s_raster_have_completed ? &s_field[s_raster_cur ^ 1]
+                                             : &s_field[s_raster_cur]);
   s_raster_port.oamAdr = ppu->oamAdr;
   s_raster_port.oamInHigh = ppu->oamInHigh;
   s_raster_port.oamSecondWrite = ppu->oamSecondWrite;
@@ -3293,6 +3328,19 @@ void ppu_rasterRenderBegin(Ppu *ppu) {
   s_raster_rendering = 1;
 }
 
+/* The beam driver renders the field the beam just finished, which is the
+ * one the journal is NOT recording any more. */
+void ppu_rasterRenderBegin(Ppu *ppu) {
+  raster_render_begin_field(ppu, -1);
+}
+
+/* A frame-model host records the field itself (it opens and closes it), so
+ * the field to render is the CURRENT one: the writes the guest made during
+ * this frame, over the state the field started from. */
+void ppu_rasterRenderBeginCurrent(Ppu *ppu) {
+  raster_render_begin_field(ppu, s_raster_cur);
+}
+
 static void raster_replay(Ppu *ppu, uint16_t reg, uint8_t val) {
   const uint8_t saved_src = g_ppu_wlog_src;
   g_ppu_wlog_src = kPpuWlogReplay;
@@ -3300,11 +3348,9 @@ static void raster_replay(Ppu *ppu, uint16_t reg, uint8_t val) {
   g_ppu_wlog_src = saved_src;
 }
 
-void ppu_rasterApplyLine(Ppu *ppu, int line) {
+static void raster_apply_until(Ppu *ppu, uint16_t limit) {
   const PpuRasterField *f = s_raster_render;
-  uint16_t limit;
-  if (!s_raster_armed || !f || line < 0) return;
-  limit = raster_key((uint16_t)line);
+  if (!s_raster_armed || !f) return;
   /* Entries are in beam order within a field, so a moving cursor is enough.
    * A write at line L lands mid-line on hardware; whole-line granularity
    * applies it from the line the host names on. Replaying through ppu_write
@@ -3324,6 +3370,22 @@ void ppu_rasterApplyLine(Ppu *ppu, int line) {
     }
     s_raster_next++;
   }
+}
+
+/* Apply the field's VBLANK entries (the NMI's writes, V=225..261, keys
+ * 0..36). A frame-model host runs the whole CPU half before it rasterizes,
+ * and the guest configures the display ONCE, from the NMI: those writes are
+ * the field's opening state, and without them the first visible line draws
+ * the field's snapshot -- the game's force-blank, no layers -- and the screen
+ * stays black for the rest of the session. The beam driver never needed
+ * this: its beam walk applies the vblank writes as it crosses them. */
+void ppu_rasterApplyVblank(Ppu *ppu) {
+  raster_apply_until(ppu, 36);
+}
+
+void ppu_rasterApplyLine(Ppu *ppu, int line) {
+  if (line < 0) return;
+  raster_apply_until(ppu, raster_key((uint16_t)line));
 }
 
 /* The render reconstructed the completed field. Writes the guest has made
@@ -3634,3 +3696,4 @@ void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val) {
       break;
   }
 }
+/* -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- */

@@ -646,13 +646,30 @@ uint8_t snes_readReg(Snes* snes, uint16_t adr) {
       // hPos by a fixed step. Calibrated so a typical busy-wait crosses
       // both edges in ~10-20 reads. Bit 6 = hblank (dots ~1024..1364 of
       // a 1364-dot scanline). See docs/VIRTUAL_HW_CONTRACT.md.
-      /* Whole-program interpreter runs already advance the beam from every
-       * opcode's measured master clocks. Applying the legacy static-recomp
-       * polling tick as well doubles time in $4212 wait loops (SMRPG's boot
-       * fades completed in half the reference frame count). */
+      /* The beam follows the CPU's clock.
+       *
+       * An interpreted run advances it from every opcode's measured master
+       * clocks (interp_bridge.c), but a RECOMPILED guest charges the clock
+       * itself (cpu->master_cycles += N) and never reaches the device layer:
+       * the beam then stands still for the whole frame. That is not a
+       * cosmetic gap. The beam never crosses V=225, so the raster journal
+       * never closes a field and a mid-field write cannot be attributed to
+       * the line it belongs to -- Secret of Mana's intro switches BG1's
+       * tilemap address by DMA in the middle of the field, and on hardware
+       * the lines below the split show the new map while the ones above
+       * still show the old one. With the whole field on one map the split
+       * vanishes, and the bottom of the screen shows the wrong frame's
+       * tiles for a fraction of a second.
+       *
+       * The guest's vblank poll is the natural place to catch up: that is
+       * where a waiting game looks at the beam, and it polls often enough
+       * for the field boundary to be crossed. The legacy synthetic 64-dot
+       * tick is replaced by it -- keeping both would double the time in
+       * $4212 wait loops (SMRPG's boot fades completed in half the
+       * reference frame count). */
       extern int g_interp_apu_driving;
       if (!g_interp_apu_driving)
-        snes_advance_beam(snes, 64, false);
+        snes_sync_master_clock(snes, g_cpu.master_cycles);
       // Bit 7 = vblank. The real frame loop drives vblank via inNmi, not
       // inVblank (inVblank is never set true), so on the static-recomp
       // path bit 7 must be SYNTHESIZED the same way bit 6 is — otherwise a
@@ -886,6 +903,9 @@ void snes_writeReg(Snes* snes, uint16_t adr, uint8_t val) {
        * last_hdmaen at 0 and wipe channel hdmaActive before every present. */
       g_snesrecomp_last_hdmaen = val;
       ppu_wlog_note_reg(0x420C, val);
+      /* Remember WHERE the mask changed: a channel that comes back on
+       * restarts its table, and Secret of Mana relies on that to split
+       * the screen at line 192. */
       /* A per-line fact as much as any PPU register: a raster handler can
        * switch channels on mid-field, and a frame-model host that samples the
        * mask once at render time never sees them. */

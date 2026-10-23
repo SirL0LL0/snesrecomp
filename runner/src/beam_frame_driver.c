@@ -10,6 +10,8 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 #include "common_cpu_infra.h"
 #include "common_rtl.h"
@@ -25,6 +27,16 @@
 
 extern CpuState g_cpu;
 extern Ppu *g_ppu;
+extern int snes_frame_counter;
+
+/* SNESRECOMP_IRQ_DIAG=1: trace the stack-pointer balance across an interrupt.
+ * A handler that leaves S outside the interrupted frame silently turns the
+ * next resume into an execute-from-WRAM (the SoM intro's Start crash). */
+static int IrqDiagWanted(void) {
+  static int s = -1;
+  if (s < 0) s = getenv("SNESRECOMP_IRQ_DIAG") ? 1 : 0;
+  return s;
+}
 
 /* One NTSC field: 262 scanlines x 1364 master clocks. */
 #define BFD_MASTER_CYCLES_PER_FIELD 357368ull
@@ -106,11 +118,20 @@ static void run_interrupt(uint32_t vector, uint64_t deadline) {
    * The bridge yields at the instruction that latched the IRQ, so the handler
    * already starts where the real CPU would take it. */
   cpu_push_interrupt_frame_at(&g_cpu, s_resume_pc);
+  const uint16_t s_pushed = g_cpu.S;
   interp_bridge_set_master_deadline(deadline);
   (void)interp_bridge_run_interrupt(&g_cpu, vector);
   /* A deadline left armed stays true for every AOT block prologue afterwards
    * and turns each compiled body into an immediate yield. */
   interp_bridge_set_master_deadline(0);
+  if (IrqDiagWanted() && snes_frame_counter >= 900 &&
+      snes_frame_counter <= 945)
+    fprintf(stderr,
+            "[irqdiag] f=%d vec=%04X resume=%06X S_push=%04X S_after=%04X "
+            "PB=%02X DB=%02X I=%u\n",
+            snes_frame_counter, (unsigned)vector, (unsigned)s_resume_pc,
+            (unsigned)s_pushed, (unsigned)g_cpu.S, (unsigned)g_cpu.PB,
+            (unsigned)g_cpu.DB, (unsigned)(g_cpu._flag_I & 1));
   update_resume_pc();
 }
 
@@ -170,6 +191,14 @@ void snes_beam_frame_driver_run_frame(void) {
     if (s_wai_halted && irq_line_asserted())
       s_wai_halted = false;
     if (!s_wai_halted && !irq_wanted()) {
+      if (IrqDiagWanted() && snes_frame_counter >= 900 &&
+          snes_frame_counter <= 945)
+        fprintf(stderr,
+                "[irqdiag] f=%d main resume=%06X S=%04X PB=%02X DB=%02X "
+                "I=%u\n",
+                snes_frame_counter, (unsigned)s_resume_pc,
+                (unsigned)g_cpu.S, (unsigned)g_cpu.PB, (unsigned)g_cpu.DB,
+                (unsigned)(g_cpu._flag_I & 1));
       interp_bridge_set_master_deadline(frame_end);
       (void)interp_bridge_run_until_quiescent(&g_cpu, s_resume_pc);
       interp_bridge_set_master_deadline(0);

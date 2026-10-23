@@ -43,7 +43,9 @@ static void put_le32(uint8_t *p, uint32_t v) { put_le16(p, (uint16_t)v); put_le1
 
 static int write_fb(const char *dir, const char *tag, const uint8_t *pixels,
                     int pitch, int x0, int h) {
-  const int w = 256;
+  const int hires = g_ppu &&
+      (((g_ppu->bgmode & 7) == 5) || ((g_ppu->bgmode & 7) == 6));
+  const int w = hires && x0 == 0 ? 512 : 256;
   uint8_t *raw = (uint8_t *)malloc((size_t)w * h * 4);
   if (!raw) return -1;
   for (int y = 0; y < h; y++)
@@ -223,11 +225,13 @@ int snes_state_dump(const char *dir, const char *tag, const uint8_t *pixels,
 
   FILE *f = open_out(dir, tag, ".info.json", "w");
   if (f) {
-    fprintf(f, "{\"frame\": %u, \"fb_width\": 256, \"fb_height\": %d, "
+    fprintf(f, "{\"frame\": %u, \"fb_width\": %d, \"fb_height\": %d, "
                "\"pixel_format\": \"BGRX8888\", \"source\": \"snesrecomp\", "
                "\"layer_mask\": %u, \"sram_size\": %u, "
                "\"master_clock\": %llu, \"vpos\": %u, \"hpos\": %u}\n",
-            frame, pixels ? height : 0, g_snes_ppu_dbg_layer_mask,
+            frame, g_ppu && (((g_ppu->bgmode & 7) == 5) ||
+                             ((g_ppu->bgmode & 7) == 6)) ? 512 : 256,
+            pixels ? height : 0, g_snes_ppu_dbg_layer_mask,
             g_snes && g_snes->cart ? g_snes->cart->ramSize : 0,
             (unsigned long long)g_cpu.master_cycles,
             g_snes ? (unsigned)g_snes->vPos : 0u,

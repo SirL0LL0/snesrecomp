@@ -101,6 +101,11 @@ typedef struct Config {
   // This is host presentation state, not emulated game state.
   bool widescreen;
   bool display_perf_title;
+  /* [General] DebugHud: 0 = off, 1 = bottom status bar, 2 = full panel +
+   * status bar. Defaults to 2 so a debug run shows the recompiled vs
+   * interpreted split without hunting for a key. [KeyMap] DisplayPerf
+   * cycles the three modes. */
+  int debug_hud;
 
   // Skip the per-frame SDL_Delay pacing. Off by default (pacing on) so audio
   // stays in sync; cfg-only escape hatch (DisableFrameDelay = 1) for users on
