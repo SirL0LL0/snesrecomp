@@ -21,10 +21,12 @@ bool snes_host_clock_simulation_due(const SnesHostClock *c, double now) {
 void snes_host_clock_simulation_done(SnesHostClock *c, double now,
                                      bool preserve_debt, double elapsed_periods) {
   double deadline = c->next_simulation + elapsed_periods / c->simulation_hz;
-  /* Keep ordinary sub-frame scheduling jitter on the original phase. A
-   * loader may preserve its backlog so its non-interactive frames refill the
-   * guest-driven audio queue; all ordinary gameplay drops stale work. */
-  c->next_simulation = preserve_debt || now <= deadline
+  /* Keep scheduling jitter and short hitches on the original phase: the next
+   * frames run back to back until the clock is on time (see host_clock.h). A
+   * loader may preserve any backlog so its non-interactive frames refill the
+   * guest-driven audio queue; a longer stall drops its stale work. */
+  c->next_simulation =
+      preserve_debt || now <= deadline + SNES_HOST_CATCHUP_PERIODS / c->simulation_hz
       ? deadline : now + 1.0 / c->simulation_hz;
   ++c->simulation_frames;
 }

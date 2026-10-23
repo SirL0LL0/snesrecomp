@@ -10,6 +10,8 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 #include "common_cpu_infra.h"
 #include "common_rtl.h"
@@ -25,6 +27,16 @@
 
 extern CpuState g_cpu;
 extern Ppu *g_ppu;
+extern int snes_frame_counter;
+
+/* SNESRECOMP_IRQ_DIAG=1: trace the stack-pointer balance across an interrupt.
+ * A handler that leaves S outside the interrupted frame silently turns the
+ * next resume into an execute-from-WRAM (the SoM intro's Start crash). */
+static int IrqDiagWanted(void) {
+  static int s = -1;
+  if (s < 0) s = getenv("SNESRECOMP_IRQ_DIAG") ? 1 : 0;
+  return s;
+}
 
 /* One NTSC field: 262 scanlines x 1364 master clocks. */
 #define BFD_MASTER_CYCLES_PER_FIELD 357368ull
@@ -40,6 +52,17 @@ static uint32_t s_resume_pc;
 
 /* The CPU executed WAI and is halted until an interrupt line asserts. */
 static bool s_wai_halted;
+
+/* HDMA halts the CPU in every visible line's H-blank. The render walk runs
+ * after the CPU half, so the CPU half charges what the previous field's walk
+ * measured (dma_hdmaLastLineCost), line by line as the beam passes them.
+ * Never charging it gave the guest ~5% more CPU per field under Secret of
+ * Mana's eight-channel intro: the background task that draws the scrolling
+ * text ran ahead of the HDMA fade that hides it, and each new text line
+ * flashed one tile row early, above the fade, at full brightness. */
+static uint32_t s_hdma_line_cost[BFD_VBLANK_LINE];
+static int s_hdma_charged;
+static bool s_hdma_seen_visible;
 
 static uint32_t read_vector(uint32_t addr) {
   /* Through the guest bus, so a mapper or coprocessor window resolves the
@@ -99,6 +122,25 @@ static void advance_parked(uint64_t until) {
   cart_sync_coprocessors(g_snes->cart, g_cpu.master_cycles);
 }
 
+/* Charge the HDMA stall of the lines the beam has passed since the last call.
+ * Only time the CPU spent executing loses those clocks: a parked or halted
+ * CPU was not going to use them, so its lines are consumed uncharged. */
+static void hdma_stall(bool cpu_running) {
+  uint32_t v = g_snes->vPos;
+  int done;
+  uint64_t stall = 0;
+  if (v < BFD_VBLANK_LINE) {
+    s_hdma_seen_visible = true;
+    done = (int)v;
+  } else {
+    done = s_hdma_seen_visible ? (int)BFD_VBLANK_LINE : 0;
+  }
+  while (s_hdma_charged < done)
+    stall += s_hdma_line_cost[s_hdma_charged++];
+  if (cpu_running && stall)
+    g_cpu.master_cycles += stall;
+}
+
 static void run_interrupt(uint32_t vector, uint64_t deadline) {
   /* The beam keeps running through the handler, as on hardware. A held beam
    * cannot satisfy a handler that polls it -- Doom's reads OPVCT to choose its
@@ -106,11 +148,20 @@ static void run_interrupt(uint32_t vector, uint64_t deadline) {
    * The bridge yields at the instruction that latched the IRQ, so the handler
    * already starts where the real CPU would take it. */
   cpu_push_interrupt_frame_at(&g_cpu, s_resume_pc);
+  const uint16_t s_pushed = g_cpu.S;
   interp_bridge_set_master_deadline(deadline);
   (void)interp_bridge_run_interrupt(&g_cpu, vector);
   /* A deadline left armed stays true for every AOT block prologue afterwards
    * and turns each compiled body into an immediate yield. */
   interp_bridge_set_master_deadline(0);
+  if (IrqDiagWanted() && snes_frame_counter >= 900 &&
+      snes_frame_counter <= 945)
+    fprintf(stderr,
+            "[irqdiag] f=%d vec=%04X resume=%06X S_push=%04X S_after=%04X "
+            "PB=%02X DB=%02X I=%u\n",
+            snes_frame_counter, (unsigned)vector, (unsigned)s_resume_pc,
+            (unsigned)s_pushed, (unsigned)g_cpu.S, (unsigned)g_cpu.PB,
+            (unsigned)g_cpu.DB, (unsigned)(g_cpu._flag_I & 1));
   update_resume_pc();
 }
 
@@ -144,6 +195,8 @@ void snes_beam_frame_driver_run_frame(void) {
   snes_set_hdma_beam_enabled(g_snes, false);
   snes_set_raster_irq_beam_enabled(true);
   ppu_rasterBegin(g_ppu);
+  s_hdma_charged = 0;
+  s_hdma_seen_visible = false;
 
   /* NMITIMEN gates NMI; nothing is delivered before reset has run, since
    * there is no instruction stream to interrupt yet. */
@@ -170,12 +223,21 @@ void snes_beam_frame_driver_run_frame(void) {
     if (s_wai_halted && irq_line_asserted())
       s_wai_halted = false;
     if (!s_wai_halted && !irq_wanted()) {
+      if (IrqDiagWanted() && snes_frame_counter >= 900 &&
+          snes_frame_counter <= 945)
+        fprintf(stderr,
+                "[irqdiag] f=%d main resume=%06X S=%04X PB=%02X DB=%02X "
+                "I=%u\n",
+                snes_frame_counter, (unsigned)s_resume_pc,
+                (unsigned)g_cpu.S, (unsigned)g_cpu.PB, (unsigned)g_cpu.DB,
+                (unsigned)(g_cpu._flag_I & 1));
       interp_bridge_set_master_deadline(frame_end);
       (void)interp_bridge_run_until_quiescent(&g_cpu, s_resume_pc);
       interp_bridge_set_master_deadline(0);
       update_resume_pc();
       if (interp_bridge_lle_took_wai())
         s_wai_halted = true;
+      hdma_stall(true);
     }
     /* Past the boundary, an interrupt belongs to the next frame. Delivering
      * one with the deadline already spent made the handler yield on its first
@@ -187,6 +249,7 @@ void snes_beam_frame_driver_run_frame(void) {
     if (irq_wanted()) {
       s_wai_halted = false;
       run_interrupt(irq_vector(), frame_end);
+      hdma_stall(true);
       continue;
     }
     /* Pay the beam what it owes first: those clocks can latch the next
@@ -194,6 +257,7 @@ void snes_beam_frame_driver_run_frame(void) {
     if (beam_debt()) {
       snes_sync_master_clock(g_snes, g_cpu.master_cycles);
       cart_sync_coprocessors(g_snes->cart, g_cpu.master_cycles);
+      hdma_stall(true);
       continue;
     }
     /* Parked on a poll or halted on WAI with field time left: hardware time
@@ -212,6 +276,7 @@ void snes_beam_frame_driver_run_frame(void) {
     if (next > frame_end)
       next = frame_end;
     advance_parked(next);
+    hdma_stall(false);
   }
 
   /* Walk the beam to the boundary -- not past it: clocks the CPU spent
@@ -246,9 +311,6 @@ void snes_beam_frame_driver_draw_ppu_frame_observed(
   snes_set_hdma_beam_enabled(g_snes, false);
   ppu_rasterRenderBegin(g_ppu);
   dma_initHdma(g_snes->dma);
-  /* Hardware's V=0 init also performs each channel's first transfer before
-   * any visible pixel. */
-  dma_primeHdmaFirstLine(g_snes->dma);
   for (line = 1; line <= 224; line++) {
     uint8_t hdmaen;
     /* A split is written in H-blank after its line is drawn, so the previous
@@ -256,11 +318,19 @@ void snes_beam_frame_driver_draw_ppu_frame_observed(
     ppu_rasterApplyLine(g_ppu, line - 1);
     if (ppu_rasterTakeHdmaen(&hdmaen))
       dma_startDma(g_snes->dma, hdmaen, true);
+    /* HDMA runs in the H-blank of the previous line, after its CPU writes,
+     * and lands on this one -- including line 0's H-blank, which performs
+     * each table's first transfer and starts its line count. Writing that
+     * first entry without stepping the channel (dma_primeHdmaFirstLine) and
+     * then transferring it again after line 1 ran every table one line late:
+     * measured against Mesen2 on Secret of Mana's intro, the window that
+     * hides the text above the fade closed at line 145 instead of 144, and
+     * the line in between showed a sliver of the next text line. */
+    dma_doHdma(g_snes->dma);
+    s_hdma_line_cost[line - 1] = dma_hdmaLastLineCost();
     ppu_runLine(g_ppu, line);
     if (observer)
       observer(g_ppu, (unsigned)line, context);
-    /* HDMA runs in the H-blank after this line; it lands on the next. */
-    dma_doHdma(g_snes->dma);
   }
   ppu_rasterRenderEnd(g_ppu);
 }
@@ -268,4 +338,28 @@ void snes_beam_frame_driver_draw_ppu_frame_observed(
 void snes_beam_frame_driver_reset(void) {
   s_resume_pc = 0;
   s_wai_halted = false;
+}
+
+void snes_beam_frame_driver_state_loaded(void) {
+  /* The resume PC is host state, not part of the guest blob: after a load it
+   * still names where the guest was BEFORE the snapshot. Take it from the
+   * restored interpreter state instead, and drop the journal recorded against
+   * the old machine. */
+  uint32_t resume = interp_bridge_lle_resume_pc();
+  if (!resume)
+    resume = interp_bridge_last_exit_pc();
+  if (resume)
+    s_resume_pc = resume;
+  s_wai_halted = false;
+  ppu_rasterReset();
+}
+
+void snes_beam_frame_driver_get_resume(uint32_t *pc, bool *wai_halted) {
+  *pc = s_resume_pc;
+  *wai_halted = s_wai_halted;
+}
+
+void snes_beam_frame_driver_set_resume(uint32_t pc, bool wai_halted) {
+  s_resume_pc = pc;
+  s_wai_halted = wai_halted;
 }

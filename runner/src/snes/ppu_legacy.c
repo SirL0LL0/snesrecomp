@@ -2,9 +2,22 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 #include "snes.h"
 #include "snes_regs.h"
+
+static int g_trace_mode5_init = 0;
+static int g_trace_mode5_on = 0;
+static int ppu_trace_mode5(void) {
+  if (!g_trace_mode5_init) {
+    const char *e = getenv("SNESRECOMP_TRACE_MODE5");
+    g_trace_mode5_on = e && *e && *e != '0';
+    g_trace_mode5_init = 1;
+  }
+  return g_trace_mode5_on;
+}
 
 static void ppu_render_pixel(Ppu *ppu, int x, int y);
 static int ppu_resolve_pixel(Ppu *ppu, int x, int y, bool sub,
@@ -71,6 +84,19 @@ void ppu_draw_whole_line_legacy(Ppu *ppu, int line) {
     ppu_prepare_mode7(ppu, line);
   int left = -ppu->extraLeftCur;
   int right = 256 + ppu->extraRightCur;
+  static int trace_init = 0, trace_on = 0;
+  if (!trace_init) {
+    trace_on = ppu_trace_mode5();
+    trace_init = 1;
+  }
+  if (trace_on && PPU_mode(ppu) == 5 && (line == 131 || line == 3 || line == 130)) {
+    fprintf(stderr,
+            "TRACE line=%d mode=%d left=%d right=%d pitch=%d extraLR=%d "
+            "extraL=%d extraR=%d forced=%d\n",
+            line, PPU_mode(ppu), left, right, ppu->renderPitch,
+            ppu->extraLeftRight, ppu->extraLeftCur, ppu->extraRightCur,
+            (int)PPU_forcedBlank(ppu));
+  }
   for (int x = left; x < right; x++) {
     ppu_render_pixel(ppu, x, line);
   }
@@ -93,6 +119,13 @@ static void ppu_render_pixel(Ppu *ppu, int x, int y) {
       b = 0;
     }
     int secondLayer = 5; // backdrop
+    if (ppu_trace_mode5() && y == 131 && PPU_mode(ppu) == 5 &&
+        (x == 2 || x == 3 || x == 4 || x == 5 || x == 10 || x == 62 ||
+         x == 64 || x == 65 || x == 124 || x == 125 || x == 126 ||
+         x == 127 || x == 128 || x == 129 || x == 250 || x == 251 ||
+         x == 252 || x == 253 || x == 254 || x == 255)) {
+      fprintf(stderr, "MAIN x=%d layer=%d rgb=%d,%d,%d\n", x, mainLayer, r, g, b);
+    }
     bool mathEnabled = mainLayer < 6 && (PPU_mathEnabled(ppu) >> mainLayer & 1) && !(
       PPU_preventMathMode(ppu) == 3 ||
       (PPU_preventMathMode(ppu) == 2 && colorWindowState) ||
@@ -100,6 +133,13 @@ static void ppu_render_pixel(Ppu *ppu, int x, int y) {
       );
     if ((mathEnabled && PPU_addSubscreen(ppu)) || PPU_pseudoHires(ppu) || PPU_mode(ppu) == 5 || PPU_mode(ppu) == 6) {
       secondLayer = ppu_resolve_pixel(ppu, x, y, true, &r2, &g2, &b2);
+      if (ppu_trace_mode5() && y == 131 && PPU_mode(ppu) == 5 &&
+          (x == 2 || x == 5 || x == 64 || x == 124 || x == 125 ||
+           x == 126 || x == 127 || x == 128 || x == 129 || x == 252 ||
+           x == 255)) {
+        fprintf(stderr, "SUB  x=%d layer=%d rgb=%d,%d,%d\n", x, secondLayer,
+                r2, g2, b2);
+      }
     }
     // TODO: subscreen pixels can be clipped to black as well
     // TODO: math for subscreen pixels (add/sub sub to main)
@@ -130,11 +170,37 @@ static void ppu_render_pixel(Ppu *ppu, int x, int y) {
     }
   }
   int row = y - 1;
-  uint8 *pixelBuffer = (uint8 *)&ppu->renderBuffer[row * ppu->renderPitch + (x + ppu->extraLeftRight) * 4];
-  pixelBuffer[0] = ((b << 3) | (b >> 2)) * PPU_brightness(ppu) / 15;
-  pixelBuffer[1] = ((g << 3) | (g >> 2)) * PPU_brightness(ppu) / 15;
-  pixelBuffer[2] = ((r << 3) | (r >> 2)) * PPU_brightness(ppu) / 15;
-  pixelBuffer[3] = 0;
+  uint8 *rowBuffer = &ppu->renderBuffer[row * ppu->renderPitch];
+  if (PPU_mode(ppu) == 5 || PPU_mode(ppu) == 6) {
+    /* Hi-res modes emit one subscreen dot followed by one main-screen dot for
+     * each logical SNES pixel. ppu_resolve_pixel() already samples those dots
+     * at x*2 and x*2+1 respectively. */
+    uint8 *pixelBuffer = rowBuffer + (x + ppu->extraLeftRight) * 8;
+    if (ppu_trace_mode5() && y == 131 && (x == 0 || x == 1 || x == 2 || x == 128 || x == 129 || x == 255)) {
+      fprintf(stderr,
+              "PIX x=%d off=%ld sub=%d,%d,%d main=%d,%d,%d\n",
+              x, (long)(pixelBuffer - rowBuffer), r2, g2, b2, r, g, b);
+    }
+    pixelBuffer[0] = ((b2 << 3) | (b2 >> 2)) * PPU_brightness(ppu) / 15;
+    pixelBuffer[1] = ((g2 << 3) | (g2 >> 2)) * PPU_brightness(ppu) / 15;
+    pixelBuffer[2] = ((r2 << 3) | (r2 >> 2)) * PPU_brightness(ppu) / 15;
+    pixelBuffer[3] = 0;
+    pixelBuffer[4] = ((b << 3) | (b >> 2)) * PPU_brightness(ppu) / 15;
+    pixelBuffer[5] = ((g << 3) | (g >> 2)) * PPU_brightness(ppu) / 15;
+    pixelBuffer[6] = ((r << 3) | (r >> 2)) * PPU_brightness(ppu) / 15;
+    pixelBuffer[7] = 0;
+  } else {
+    uint8 *pixelBuffer = rowBuffer + (x + ppu->extraLeftRight) * 4;
+    if (ppu_trace_mode5() && y == 131 && (x == 0 || x == 1 || x == 2 || x == 128 || x == 129 || x == 255)) {
+      fprintf(stderr,
+              "PIXLO x=%d off=%ld main=%d,%d,%d\n",
+              x, (long)(pixelBuffer - rowBuffer), r, g, b);
+    }
+    pixelBuffer[0] = ((b << 3) | (b >> 2)) * PPU_brightness(ppu) / 15;
+    pixelBuffer[1] = ((g << 3) | (g >> 2)) * PPU_brightness(ppu) / 15;
+    pixelBuffer[2] = ((r << 3) | (r >> 2)) * PPU_brightness(ppu) / 15;
+    pixelBuffer[3] = 0;
+  }
 }
 
 static int ppu_resolve_pixel(Ppu *ppu, int x, int y, bool sub,
@@ -145,12 +211,21 @@ static int ppu_resolve_pixel(Ppu *ppu, int x, int y, bool sub,
   actMode = PPU_mode(ppu) == 7 && PPU_m7extBg(ppu) ? 9 : actMode;
   int layer = 5;
   int pixel = 0;
+  if (y == 200 && (x == 10 || x == 200)) {
+    fprintf(stderr, "RES x=%d y=%d mode=%d act=%d tm=%02X ts=%02X count=%d\n",
+            x, y, PPU_mode(ppu), actMode, ppu->screenEnabled[0],
+            ppu->screenEnabled[1], layer_count_per_mode[actMode]);
+  }
   for (int i = 0; i < layer_count_per_mode[actMode]; i++) {
     int curLayer = layers_per_mode[actMode][i];
     int curPriority = priorities_per_mode[actMode][i];
     bool layerActive = IS_SCREEN_ENABLED(ppu, sub, curLayer) && (
       !IS_SCREEN_WINDOWED(ppu, sub, curLayer) || !ppu_window_contains(ppu, curLayer, x)
       );
+    if (y == 200 && (x == 10 || x == 200)) {
+      fprintf(stderr, "  i=%d layer=%d prio=%d active=%d\n",
+              i, curLayer, curPriority, (int)layerActive);
+    }
     if (layerActive) {
       if (curLayer < 4) {
         // bg layer
@@ -298,9 +373,22 @@ static int ppu_sample_bg(Ppu *ppu, int x, int y, int layer, bool priority) {
   int tileBitsY = PPU_bigTiles(ppu, layer) ? 4 : 3;
   int tileHighBitY = PPU_bigTiles(ppu, layer) ? 0x200 : 0x100;
   uint16_t tilemapAdr = PPU_bgTilemapAdr(ppu, layer) + (((y >> tileBitsY) & 0x1f) << 5 | ((x >> tileBitsX) & 0x1f));
+  if (ppu_trace_mode5() && layer == 1 && PPU_mode(ppu) == 5 && (y & 0x3ff) == 130 &&
+      (x == 0 || x == 255 || x == 256 || x == 511)) {
+    fprintf(stderr,
+            "BG2 x=%d y=%d wide=%d bitsX=%d base=%04X off=%04X tile=%04X\n",
+            x, y, (int)wideTiles, tileBitsX, PPU_bgTilemapAdr(ppu, layer),
+            (unsigned)(tilemapAdr - PPU_bgTilemapAdr(ppu, layer)),
+            (unsigned)PpuRenderVram(ppu)[tilemapAdr & 0x7fff]);
+  }
   if ((x & tileHighBitX) && PPU_bgTilemapWider(ppu, layer)) tilemapAdr += 0x400;
   if ((y & tileHighBitY) && PPU_bgTilemapHigher(ppu, layer)) tilemapAdr += PPU_bgTilemapWider(ppu, layer) ? 0x800 : 0x400;
   uint16_t tile = PpuRenderVram(ppu)[tilemapAdr & 0x7fff];
+  if (layer == 2 && y == 200 && (x == 10 || x == 200)) {
+    fprintf(stderr, "BG3pre x=%d mode=%d e=%04X tile=%d eprio=%d wantprio=%d tmadr=%04X\n",
+            x, PPU_mode(ppu), tile, tile & 0x3ff, (tile >> 13) & 1,
+            (int)priority, tilemapAdr);
+  }
   // check priority, get palette
   if (((bool)(tile & 0x2000)) != priority) return 0; // wrong priority
   int paletteNum = (tile & 0x1c00) >> 10;
@@ -340,6 +428,11 @@ static int ppu_sample_bg(Ppu *ppu, int x, int y, int layer, bool priority) {
     uint16_t plane4 = PpuRenderVram(ppu)[(PPU_bgTileAdr(ppu, layer) + ((tileNum & 0x3ff) * 4 * bitDepth) + 24 + row) & 0x7fff];
     pixel |= ((plane4 >> col) & 1) << 6;
     pixel |= ((plane4 >> (8 + col)) & 1) << 7;
+  }
+  if (layer == 2 && y == 200 && (x == 10 || x == 200)) {
+    fprintf(stderr, "BG3post x=%d pixel=%d pal=%d depth=%d cgram=%d\n",
+            x, pixel, paletteNum, bitDepth,
+            pixel == 0 ? 0 : paletteSize * paletteNum + pixel);
   }
   // return cgram index, or 0 if transparent, palette number in bits 10-8 for 8-color layers
   return pixel == 0 ? 0 : paletteSize * paletteNum + pixel;

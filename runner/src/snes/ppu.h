@@ -571,6 +571,10 @@ void ppu_reset(Ppu* ppu);
 bool ppu_checkOverscan(Ppu* ppu);
 void ppu_handleVblank(Ppu* ppu);
 void ppu_runLine(Ppu* ppu, int line);
+/* Set by the host for a frame it will not present (fast-forward): lines still
+ * run (sprite evaluation, everything the guest can observe) but draw no
+ * pixels. */
+extern bool g_ppu_skip_pixels;
 
 /* Bind an additional XRGB8888 frame with 1..4 samples per native pixel in
  * each dimension. Width is 256 + twice the current centering budget; height
@@ -603,12 +607,19 @@ void ppu_set_vram_write_log_hook(PpuVramWriteLogHook hook);
  * brackets its render loop with RenderBegin / ApplyLine per line / RenderEnd. */
 void ppu_rasterBegin(Ppu *ppu);
 void ppu_rasterRenderBegin(Ppu *ppu);
+  /* A frame-model host renders the field it just recorded. */
+  void ppu_rasterRenderBeginCurrent(Ppu *ppu);
 void ppu_rasterRenderEnd(Ppu *ppu);
 int  ppu_rasterTakeHdmaen(uint8_t *out);
 void ppu_rasterRecord(uint16_t reg, uint16_t line, uint8_t val);
-void ppu_rasterApplyLine(Ppu *ppu, int line);
-/* Called by the beam walk when it reaches V=225. */
-void ppu_rasterFieldBoundary(void);
+  /* The $420C (HDMAEN) writes of the field, with the line they landed
+   * on. A mid-field disable/enable re-arms the channels' tables, which
+   * is how Secret of Mana splits the screen; the host's raster walk
+   * replays them. */
+/* A frame-model host owns the field boundary: it calls this at the start
+ * and at the end of its frame, and the beam no longer closes the field. */
+void ppu_rasterHostFieldBoundary(void);
+void ppu_rasterSetHostFieldBoundary(bool host_driven);
 /* Disarm, for a machine rebuild (session reset). */
 void ppu_rasterReset(void);
 

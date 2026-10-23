@@ -454,6 +454,46 @@ static uint32_t snes_advance_beam(Snes *snes, uint32_t clocks, bool check_irq) {
       }
       if (line_matches && target < 1364u && target >= h && target < h + span) {
         uint32_t upto = target - h + 1u;   /* stop one clock past the match */
+        /* A comparator that fires while the IRQ line is ALREADY asserted
+         * changes nothing: the line stays asserted, no new interrupt is
+         * pending, and the CPU sees exactly the same state it saw before.
+         * The beam must keep walking past it.
+         *
+         * Stopping here anyway parks the beam on the comparator's line and
+         * never lets it reach vblank: a guest that disabled interrupts and
+         * polls $4212 for the vblank bit then waits for a flag that can never
+         * rise. Measured on Secret of Mana: the vertical comparator at line
+         * 192 latched every frame, the guest masked interrupts and spun on
+         * $4212 from frame 2560 on, and the beam never passed line 192 --
+         * so the name-entry screen never appeared and the sprite table was
+         * never uploaded.
+         *
+         * The first latch of a field is the one that pre-empts: the beam
+         * stops one clock past the match and the remainder is owed, because
+         * the handler has not run yet and the code that would have run after
+         * it must not be charged to the pre-handler timeline. */
+        if (snes->inIrq) {
+          h += upto;
+          consumed += upto;
+          clocks -= upto;
+          if (h >= 1364u) {
+            h = 0; v++; if (v >= 262u) v = 0;
+            if (v == 225u) { snes->rdnmiPending = true; ppu_rasterFieldBoundary(); }
+            if (v == 0u) snes->rdnmiPending = false;
+          }
+          /* Publish the position before continuing. The walk's h/v are
+           * locals; the beam's real position lives in snes->hPos/vPos and is
+           * written back at the end of the function -- which this `continue`
+           * skips. Without this the advanced position is DISCARDED on every
+           * pass, and the beam crawls: measured on Secret of Mana it reached
+           * line 181 and no further, so it never crossed into vblank, the
+           * NMI never arrived, and the game sat in its vblank wait for the
+           * rest of the session. */
+          snes->hPos = (uint16_t)h;
+          snes->vPos = (uint16_t)v;
+          snes->inVblank = v >= 225u;
+          continue;
+        }
         snes->inIrq = true;
         snes->dbgIrqLatches++;
         snes->dbgLatchedThisField = 1;
@@ -622,6 +662,25 @@ uint8_t snes_readReg(Snes* snes, uint16_t adr) {
   switch(adr) {
     case 0x4210: {
       uint8_t val = 0x2; // CPU version (4 bit)
+      /* Bring the beam up to the CPU's clock before reporting the NMI flag.
+       *
+       * $4210 bit 7 is "an NMI is pending" -- the vblank edge. A guest that
+       * polls it is waiting for the beam to reach V=225, so the beam has to
+       * move as the guest runs, or the poll can never be satisfied.
+       *
+       * The beam walk stops early when it latches an interrupt, so the
+       * un-walked remainder is OWED and released only by the next sync. If
+       * the only sync in the guest's loop is suppressed, that remainder is
+       * never released and the beam stalls -- it does not merely lag, it
+       * stops: measured on Secret of Mana the beam sat on line 192 and the
+       * guest waited for the NMI flag for the rest of the session, so the
+       * name-entry screen never appeared and the sprite table was never
+       * uploaded.
+       *
+       * $4210 and $4212 are both "where is the beam" queries, so both sync
+       * it. $4210 additionally CLEARS the pending latch on read (hardware
+       * behaviour, below), which is why the guest can use it as a wait. */
+      snes_sync_master_clock(snes, g_cpu.master_cycles);
       // Beam-driven hosts latch independently of NMITIMEN. Keep accepting
       // inNmi for existing frame hosts which explicitly deliver each NMI.
       val |= (snes->rdnmiPending || snes->inNmi) << 7;
@@ -646,13 +705,45 @@ uint8_t snes_readReg(Snes* snes, uint16_t adr) {
       // hPos by a fixed step. Calibrated so a typical busy-wait crosses
       // both edges in ~10-20 reads. Bit 6 = hblank (dots ~1024..1364 of
       // a 1364-dot scanline). See docs/VIRTUAL_HW_CONTRACT.md.
-      /* Whole-program interpreter runs already advance the beam from every
-       * opcode's measured master clocks. Applying the legacy static-recomp
-       * polling tick as well doubles time in $4212 wait loops (SMRPG's boot
-       * fades completed in half the reference frame count). */
-      extern int g_interp_apu_driving;
-      if (!g_interp_apu_driving)
-        snes_advance_beam(snes, 64, false);
+      /* The beam follows the CPU's clock.
+       *
+       * An interpreted run advances it from every opcode's measured master
+       * clocks (interp_bridge.c), but a RECOMPILED guest charges the clock
+       * itself (cpu->master_cycles += N) and never reaches the device layer:
+       * the beam then stands still for the whole frame. That is not a
+       * cosmetic gap. The beam never crosses V=225, so the raster journal
+       * never closes a field and a mid-field write cannot be attributed to
+       * the line it belongs to -- Secret of Mana's intro switches BG1's
+       * tilemap address by DMA in the middle of the field, and on hardware
+       * the lines below the split show the new map while the ones above
+       * still show the old one. With the whole field on one map the split
+       * vanishes, and the bottom of the screen shows the wrong frame's
+       * tiles for a fraction of a second.
+       *
+       * The guest's vblank poll is the natural place to catch up: that is
+       * where a waiting game looks at the beam, and it polls often enough
+       * for the field boundary to be crossed. The legacy synthetic 64-dot
+       * tick is replaced by it -- keeping both would double the time in
+       * $4212 wait loops (SMRPG's boot fades completed in half the
+       * reference frame count).
+       *
+       * The sync must happen on EVERY read, including while the interpreter
+       * is driving (g_interp_apu_driving). It used to be suppressed there,
+       * on the theory that the interpreted path advances the beam from every
+       * opcode -- true, but only for the opcodes it actually executes. A
+       * guest that polls $4212 in a tight loop executes few opcodes, so the
+       * beam barely moved, and the loop then waited for a flag the beam
+       * would not reach. Worse, the beam walk stops early when it latches
+       * an interrupt, so the un-walked remainder is OWED and released only
+       * by the next sync: with the read's own sync suppressed, that
+       * remainder was never released and the beam crawled.
+       *
+       * Measured on Secret of Mana: the beam reached line 181 and no
+       * further, never crossed into vblank, the NMI never arrived, and the
+       * game sat in its vblank wait for the rest of the session -- so the
+       * name-entry screen never appeared and the sprite table was never
+       * uploaded. */
+      snes_sync_master_clock(snes, g_cpu.master_cycles);
       // Bit 7 = vblank. The real frame loop drives vblank via inNmi, not
       // inVblank (inVblank is never set true), so on the static-recomp
       // path bit 7 must be SYNTHESIZED the same way bit 6 is — otherwise a
@@ -886,6 +977,9 @@ void snes_writeReg(Snes* snes, uint16_t adr, uint8_t val) {
        * last_hdmaen at 0 and wipe channel hdmaActive before every present. */
       g_snesrecomp_last_hdmaen = val;
       ppu_wlog_note_reg(0x420C, val);
+      /* Remember WHERE the mask changed: a channel that comes back on
+       * restarts its table, and Secret of Mana relies on that to split
+       * the screen at line 192. */
       /* A per-line fact as much as any PPU register: a raster handler can
        * switch channels on mid-field, and a frame-model host that samples the
        * mask once at render time never sees them. */

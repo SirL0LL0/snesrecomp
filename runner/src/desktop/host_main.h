@@ -70,6 +70,16 @@ typedef struct SnesDesktopHostGame {
                                     is picked up without a prompt; NULL: skip */
   const char *expected_sha256_hex; /* 64 hex chars, or NULL/"" = cannot verify */
   const char *expected_crc32_hex;  /* 8 hex chars, or NULL/"" */
+  /* Further SHA-256 digests that identify a good dump for this title.
+   *
+   * Purely additive to expected_sha256_hex: a title that ships a language
+   * pack accepts the base ROM it was translated from as well as the image
+   * its code was generated from -- the pack turns the base into the latter
+   * in memory, and the launcher has to let the player pick the base.
+   * The launcher takes a list of digests (known_sha256 / num_known_sha256),
+   * so this only has to carry the extra ones. NULL/0 = none. */
+  const char *const *known_sha256_hex;
+  int num_known_sha256;
   const char *game_id;           /* mod-package target id; NULL: mods off */
   const char *build_version;     /* "dev" or the release stamp */
   const char *env_prefix;        /* "SM": SM_RUN_FRAMES etc. are honoured as
@@ -111,6 +121,18 @@ typedef struct SnesDesktopHostGame {
   void (*after_config)(void);
   /* The ROM bytes just read, before SnesInit. */
   void (*on_rom_loaded)(const uint8_t *rom, size_t size);
+  /* After on_rom_loaded and after the mod plan is committed: may change the
+   * in-memory image (a mod's IPS) before SnesInit. Same size; the file on
+   * disk is never touched. Returns 0 to refuse the launch (Die gets `error`). */
+  int (*patch_rom)(uint8_t *rom, size_t size, char *error, size_t error_cap);
+  /* Like patch_rom, but the image may change size.
+   *
+   * A language pack turns a base ROM into the image the code was generated
+   * from, and that image can be larger: the translation adds banks. The
+   * hook hands back a malloc-owned buffer (the host frees the one it read)
+   * and its size; the file on disk is never touched. Returns 0 to refuse the
+   * launch (Die gets `error`). Runs before patch_rom. */
+  int (*patch_rom_ex)(uint8_t **rom, size_t *size, char *error, size_t error_cap);
   /* The guest's timeline just jumped: reset, save-state load, an overlay
    * closed after freezing it. Presenters drop interpolation history here. */
   void (*on_reset)(void);
@@ -197,6 +219,12 @@ typedef struct SnesDesktopHostGame {
   /* After the gameplay loop ends, before SDL resources are destroyed or a
    * relaunch begins. Stop title-owned workers here. No further frames run. */
   void (*on_shutdown)(void);
+  /* Opt in to recomp-ui's in-game menu drawn over the frozen game: Escape or
+   * [Controller] MenuGesture (default Select+Start) opens it. Display, audio,
+   * save states, reset and quit, applied live and written to config.ini.
+   * Requires a launcher build (RECOMP_LAUNCHER). Zero keeps today's
+   * behaviour exactly. */
+  int in_game_menu;
 } SnesDesktopHostGame;
 
 /* The whole program. Returns the process exit code. */

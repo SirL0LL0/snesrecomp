@@ -9,12 +9,18 @@
  * display's refresh rate while simulating at the guest's, interpolating
  * between simulated frames; `alpha` is the interpolation weight.
  *
- * Debt policy: an ordinary slow frame drops its wall-time debt (the next
- * deadline is re-anchored to now) so the guest never bursts forward to catch
- * up. A game may ask to PRESERVE the debt for phases where bursting is the
- * right thing -- Super Metroid's door transitions, whose non-interactive
- * frames refill the guest-driven audio queue -- through the host descriptor's
- * keep_pacing_debt hook.
+ * Debt policy: a frame that ends up to SNES_HOST_CATCHUP_PERIODS late keeps
+ * its phase, and the following frames run back to back until the clock is on
+ * time again. Audio is produced in guest time, so every period dropped is a
+ * period of samples the device never gets: dropping the debt after each 20-50
+ * ms hitch lost ~0.8% of the guest's time on a 165 Hz display, drained the
+ * ~67 ms audio cushion every 10-25 s, and each underflow faded the music out
+ * and back in. Lateness beyond that window (a load, a window drag, a
+ * breakpoint) still drops its debt and re-anchors to now, so the guest never
+ * sprints after a real stall. A game may ask to PRESERVE all debt for phases
+ * where bursting is the right thing -- Super Metroid's door transitions,
+ * whose non-interactive frames refill the guest-driven audio queue -- through
+ * the host descriptor's keep_pacing_debt hook.
  *
  * Moved up from SuperMetroidRecomp's sm_video.c, where it was called SmClock
  * and hardwired to that title's frame rate. Nothing in it was Super Metroid.
@@ -22,6 +28,11 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+
+/* How far behind (in simulation periods) the clock catches up rather than
+ * re-anchoring. Matches the audio delivery cushion (RTL_AUDIO_TARGET_NATIVES,
+ * four native blocks). */
+#define SNES_HOST_CATCHUP_PERIODS 4.0
 
 #ifdef __cplusplus
 extern "C" {
