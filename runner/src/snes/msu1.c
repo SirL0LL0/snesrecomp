@@ -80,6 +80,10 @@ static int s_mix_buf_cap;         /* frames capacity of s_mix_buf */
 static double s_mix_phase;        /* fractional 44.1kHz position, carried over */
 static int16_t s_mix_carry[8 * 2];
 static int s_mix_carry_count;
+/* msu1_set_track_gain: the gain and the limiter's peak envelope (post-volume
+ * sample units), reset with every track. */
+static double s_track_gain = 1.0;
+static double s_limit_env;
 static Msu1TrackResolver s_track_resolver;
 static void *s_track_context;
 
@@ -244,6 +248,8 @@ static void msu_load_track(uint16_t track) {
      * resample tail or phase from the previous track bleed into it. */
     s_mix_phase = 0.0;
     s_mix_carry_count = 0;
+    s_track_gain = 1.0;
+    s_limit_env = 0.0;
 
     char fn[MSU1_PATH_MAX + 32] = {0};
     if (s_track_resolver) {
@@ -348,6 +354,13 @@ void msu1_write(uint16_t reg, uint8_t val) {
     RtlApuUnlock();
 }
 
+void msu1_set_track_gain(double gain) {
+    if (!msu1_enabled()) return;
+    RtlApuLock();
+    s_track_gain = gain > 0.0 ? gain : 1.0;
+    RtlApuUnlock();
+}
+
 /* ── audio mix (audio thread, APU lock already held) ─────────────────── */
 
 /* Fill `frames` stereo frames from the track, looping or stopping at EOF.
@@ -433,6 +446,10 @@ void msu1_mix(int16_t *out, int out_frames) {
 
     if (g.volume != 0) {
         const int vol = g.volume;  /* 0..255, linear */
+        /* Track gain limiter: instant attack, ~0.5 s release, so the gain
+         * never takes the louder channel past kLimit. */
+        const double kLimit = 28000.0;
+        const double release = 1.0 - 1.0 / (0.5 * output_rate);
         for (int i = 0; i < out_frames; i++) {
             double pos = s_mix_phase + (double)i * ratio;
             int idx = (int)pos;
@@ -441,14 +458,23 @@ void msu1_mix(int16_t *out, int out_frames) {
             if (idx  > need - 1) idx  = need - 1;
             if (idx1 > need - 1) idx1 = need - 1;
 
+            int s[2];
             for (int ch = 0; ch < 2; ch++) {
                 int s0 = s_mix_buf[idx * 2 + ch];
                 int s1 = s_mix_buf[idx1 * 2 + ch];
-                int s  = (int)(s0 + (s1 - s0) * frac);  /* linear interpolation */
-                s = (s * vol) / 255;
-                int o = out[i * 2 + ch] + s;
-                out[i * 2 + ch] = clamp_s16(o);
+                s[ch] = (int)(s0 + (s1 - s0) * frac);  /* linear interpolation */
+                s[ch] = (s[ch] * vol) / 255;
             }
+            if (s_track_gain != 1.0) {
+                double peak = (double)(abs(s[0]) > abs(s[1]) ? abs(s[0]) : abs(s[1]));
+                s_limit_env = peak > s_limit_env ? peak : s_limit_env * release;
+                double gain = s_track_gain;
+                if (s_limit_env * gain > kLimit) gain = kLimit / s_limit_env;
+                s[0] = (int)(s[0] * gain);
+                s[1] = (int)(s[1] * gain);
+            }
+            for (int ch = 0; ch < 2; ch++)
+                out[i * 2 + ch] = clamp_s16(out[i * 2 + ch] + s[ch]);
         }
     }
     /* else: still advance the cursor above; just don't mix (matches prior

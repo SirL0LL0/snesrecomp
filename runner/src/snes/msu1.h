@@ -76,4 +76,10 @@ void    msu1_write(uint16_t reg, uint8_t val);
  * playing. */
 void msu1_mix(int16_t *out, int out_frames);
 
+/* Extra gain for the track now selected (1.0 = none), for packs whose tracks
+ * are mastered at very different levels. Above 1.0 a peak limiter follows
+ * the track, so loud passages are pulled back instead of clipping. Selecting
+ * a track ($2005) resets it to 1.0: set it after the select. */
+void msu1_set_track_gain(double gain);
+
 #endif /* SNESRECOMP_MSU1_H */
